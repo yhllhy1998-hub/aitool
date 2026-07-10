@@ -19,4 +19,4 @@ data/.user_guide_seen
 
 # PyInstaller build artifacts
 build/
-dist/
+*.spec

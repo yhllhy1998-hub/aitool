@@ -506,7 +506,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             dialog.transient(self)
             dialog.grab_set()
 
-            ctk.CTkLabel(dialog, text="⚙️ AiTool 设置中心",
+             ctk.CTkLabel(dialog, text="⚙️ AiTool 桌面工具 设置中心",
                          font=ctk.CTkFont(family=FONT, size=13, weight="bold"),
                          text_color=THEME["primary_hover"]).pack(pady=(20, 16))
 
@@ -588,7 +588,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 pystray.MenuItem("彻底退出", _quit_app)
             )
 
-            self._tray_icon = pystray.Icon("AiTool", img, "AiTool 生产力助手", menu)
+             self._tray_icon = pystray.Icon("AiTool", img, "AiTool 桌面工具", menu)
             
             # 使用 threading 启动托盘图标轮询监听，防止阻塞 Tkinter 的 mainloop 主线程！
             threading.Thread(target=self._tray_icon.run, daemon=True).start()
