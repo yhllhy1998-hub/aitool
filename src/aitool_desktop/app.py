@@ -377,11 +377,25 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _create_app_icon(self):
         """生成并返回一个统一的高颜值科技感图标 (PIL.Image 格式)"""
         from PIL import Image, ImageDraw
-        # 动态绘制 64x64 圆角矩形加能量圆环科技微光火箭图标
-        img = Image.new("RGB", (64, 64), (26, 27, 46)) # 与底色 (1a1b2e) 完全契合的优雅蓝黑色背景
+        # 动态绘制 64x64 代表 AiTool 的深邃高贵深蓝色/紫色渐变圆角方框，搭配白/浅蓝极简火箭造型
+        img = Image.new("RGB", (64, 64), (16, 17, 28)) # 深黑蓝色背景衬底，防止托盘毛刺
         draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#7c6ef0")
-        draw.ellipse([20, 24, 44, 44], fill="#f0f1f8")
+        # 1. 绘制主体圆角方框 (深邃科技靛蓝色)
+        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#2a2e45", outline="#4a557a", width=2)
+        
+        # 2. 绘制极简、炫酷的渐变科技紫蓝圆盾
+        draw.rounded_rectangle([12, 12, 52, 52], radius=10, fill="#7c6ef0")
+        
+        # 3. 绘制能量火箭：中央由白色能量舱和两侧青蓝色侧翼组合而成的箭矢图案 (极简几何火箭)
+        # 火箭头部 (等腰三角形)
+        draw.polygon([(32, 18), (22, 34), (42, 34)], fill="#ffffff")
+        # 火箭中段舱体 (矩形)
+        draw.rectangle([26, 34, 38, 44], fill="#ffffff")
+        # 两侧青色箭翼
+        draw.polygon([(26, 38), (18, 44), (26, 44)], fill="#2cf0f8") # 左翼
+        draw.polygon([(38, 38), (46, 44), (38, 44)], fill="#2cf0f8") # 右翼
+        # 底部喷气火焰 (橙红点缀)
+        draw.polygon([(28, 44), (32, 50), (36, 44)], fill="#ff7c43")
         return img
 
     def _init_window(self) -> None:
