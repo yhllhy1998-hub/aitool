@@ -1,0 +1,35 @@
+{
+  "version": "2026-07-08",
+  "projects": [
+    {
+      "id": "aitool",
+      "path": "D:\\LHYsAuto\\AiTool",
+      "role": "正式项目 / harness实践项目",
+      "owner": "Codex",
+      "designated_master_controller_thread": "019f3a9b-9dfd-74a0-97eb-820fb8f94ac5",
+      "primary_phases": [
+        "项目定位收口",
+        "真实需求交付",
+        "通用能力沉淀"
+      ],
+      "use_for": [
+        "承接真实需求与交付",
+        "沉淀主控、执行、验证、治理实践",
+        "判断哪些稳定做法值得后续收束为可复用方案"
+      ],
+      "not_for": [
+        "把项目重新定义回外部实验沙箱",
+        "只围绕空项目部署叙事推进",
+        "在真实需求闭环跑通前过度扩张 Phase 2 系统"
+      ],
+      "positioning_docs": [
+        "docs/project-positioning.md"
+      ],
+      "governance_contract": [
+        "AiTool 以正式项目方式推进真实需求。",
+        "harness 结构服务交付，不替代交付本身。",
+        "稳定经验可以继续沉淀，但不能压过真实需求的优先级。"
+      ]
+    }
+  ]
+}

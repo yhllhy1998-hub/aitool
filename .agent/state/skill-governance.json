@@ -1,0 +1,36 @@
+{
+  "version": "2026-07-08",
+  "primary_governance_sources": [
+    "AGENTS.md",
+    "docs/master-controller-handbook.md",
+    "docs/project-architecture.md",
+    "docs/version-plan.md",
+    "docs/self-evolution-architecture.md"
+  ],
+  "external_skill_policy": {
+    "default_role": "secondary_reference_only",
+    "goal": "外部技能只能辅助项目推进，不能替代本项目的主控治理。",
+    "before_use_checks": [
+      "项目本地规则是否已经足够说明当前问题？",
+      "这个技能是否真的提供了额外执行价值，而不是重复治理口径？",
+      "能否用一句话说明调用它的理由？"
+    ]
+  },
+  "skills": {
+    "agent-workflow": {
+      "role": "workflow-design-helper",
+      "allowed_when": [
+        "确实需要设计自动化工作流",
+        "需要规划明确的多步骤依赖关系",
+        "需要定义执行顺序、重试、监控或单元之间的交接"
+      ],
+      "not_for": [
+        "泛化项目接手",
+        "替代主控手册",
+        "在本地治理已经足够时接管常规阶段推进",
+        "把项目定位讲成一套抽象工作流哲学"
+      ],
+      "why": "主控手册和项目文档是第一治理源。agent-workflow 只在确实需要流程设计时才作为辅助工具出现。"
+    }
+  }
+}
