@@ -6,10 +6,13 @@ __pycache__/
 .pytest_cache/
 
 # Harness runtime noise
+.agent/
+.agents/
 .agent/logs/safe-run.log
 
 # Desktop tool local state
 data/*.json
+data/.user_guide_seen
 
 # Platform-specific local config
 .codex/

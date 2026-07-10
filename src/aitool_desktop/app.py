@@ -793,6 +793,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             for w in (icon_label, name_label):
                 w.configure(bg=THEME["hover"])
             btn.configure(text_color=THEME["text_sec"], fg_color="transparent") # hover 时醒目亮起
+            # 用不显眼的暗灰色字体在下方状态栏显示该文件的完整物理路径
+            self._set_status(entry.path, "muted")
 
         def on_leave(e):
             # 获取鼠标当前坐标，防止因鼠标落在子 Label 上产生的虚假 leave 触发闪烁
@@ -807,6 +809,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 for w in (icon_label, name_label):
                     w.configure(bg=THEME["surface"])
                 btn.configure(text_color=THEME["surface"], fg_color="transparent") # 完美熄灭且绝不位移抖动
+                # 恢复经典“就绪”状态
+                self._set_status("就绪", "ready")
 
         item.bind("<Enter>", on_enter)
         item.bind("<Leave>", on_leave)
@@ -820,6 +824,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         for w in (item, name_label, icon_label):
             w.bind("<Double-Button-1>", lambda e, ent=entry: self._open_entry(ent))
+            w.bind("<Button-3>", lambda e, ent=entry: self._open_entry_folder(ent)) # 鼠标右键（Button-3）点击时自动打开所在文件夹并选中
 
         for w in (name_label, icon_label):
             w.drag_source_register(1, DND_FILES)
@@ -1152,6 +1157,37 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     # ============================================================
     # 中转站操作
     # ============================================================
+
+    def _open_entry_folder(self, entry: StationEntry) -> None:
+        """右键点击中转站文件项时，自动打开其所在文件夹，并定位/选中该文件。"""
+        p = Path(entry.path)
+        if not p.exists():
+            # 即使文件本身不存在了，但如果父目录存在，也可以尝试打开父目录
+            if p.parent.exists():
+                folder_path = p.parent
+            else:
+                messagebox.showwarning("入口失效", "所选路径及其所在文件夹均已不存在。", parent=self)
+                return
+        else:
+            folder_path = p.parent
+
+        import subprocess
+        if os.name == "nt":
+            # Windows 特有方式：在文件资源管理器中打开文件夹并选中该文件
+            try:
+                if p.exists():
+                    subprocess.run(["explorer", "/select,", str(p.resolve())], check=False)
+                else:
+                    subprocess.run(["explorer", str(folder_path.resolve())], check=False)
+                self._set_status(f"已打开文件夹: {folder_path.name}", "ready")
+            except Exception as e:
+                self._toast(f"打开文件夹失败: {e}", "danger")
+        else:
+            # 兼容其他系统
+            if hasattr(os, "startfile"):
+                os.startfile(str(folder_path))
+            else:
+                subprocess.run(["open", str(folder_path)])
 
     def _open_entry(self, entry: StationEntry) -> None:
         p = Path(entry.path)
@@ -1644,7 +1680,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _set_status(self, text: str, level: str = "ready") -> None:
         self.status_label.configure(text=text)
         colors = {"ready": THEME["success"], "warning": THEME["warning"],
-                  "blocked": THEME["danger"]}
+                  "blocked": THEME["danger"], "muted": THEME["text_muted"]}
         self.status_dot.configure(text_color=colors.get(level, THEME["success"]))
 
     _toast_label = None
