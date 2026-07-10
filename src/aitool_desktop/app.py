@@ -377,13 +377,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _create_app_icon(self):
         """生成并返回一个统一的高颜值科技感图标 (PIL.Image 格式)"""
         from PIL import Image, ImageDraw
-        # 动态绘制 64x64 代表 AiTool 干净、极简、高贵的蓝紫色圆角双层方框
-        img = Image.new("RGB", (64, 64), (16, 17, 28)) # 深黑蓝色背景衬底，防止托盘毛刺
+        # 1. 采用与软件左上角、任务栏一致的高颜值科技感蓝紫色圆角双层方框
+        img = Image.new("RGB", (64, 64), (26, 27, 46)) # 与软件底色契合的优雅蓝黑色背景
         draw = ImageDraw.Draw(img)
-        # 1. 绘制第一层主体圆角方框 (深邃科技靛蓝色)
-        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#2a2e45", outline="#4a557a", width=2)
         
-        # 2. 绘制第二层极简、炫酷的渐变科技紫蓝圆方框
+        # 外层方框 (深邃科技靛蓝色)
+        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#2a2e45", outline="#4a557a", width=2)
+        # 内层方框 (炫酷的渐变科技紫蓝色)
         draw.rounded_rectangle([12, 12, 52, 52], radius=10, fill="#7c6ef0")
         return img
 
