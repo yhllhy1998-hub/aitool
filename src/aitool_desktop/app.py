@@ -374,6 +374,16 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     # 窗口
     # ============================================================
 
+    def _create_app_icon(self):
+        """生成并返回一个统一的高颜值科技感图标 (PIL.Image 格式)"""
+        from PIL import Image, ImageDraw
+        # 动态绘制 64x64 圆角矩形加能量圆环科技微光火箭图标
+        img = Image.new("RGB", (64, 64), (26, 27, 46)) # 与底色 (1a1b2e) 完全契合的优雅蓝黑色背景
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#7c6ef0")
+        draw.ellipse([20, 24, 44, 44], fill="#f0f1f8")
+        return img
+
     def _init_window(self) -> None:
         self.title("AiTool")
         self.geometry("360x580")
@@ -383,6 +393,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.attributes("-topmost", True)
         self._pinned = True
         self.overrideredirect(False)
+
+        # 设置 Windows 任务栏和左上角的应用程序窗口图标，与托盘图标完美保持一致！
+        try:
+            from PIL import ImageTk
+            app_icon_img = self._create_app_icon()
+            self._app_icon_photo = ImageTk.PhotoImage(app_icon_img)
+            self.iconphoto(True, self._app_icon_photo)
+        except Exception:
+            pass
 
         # 拦截关闭按钮：改为最小化到系统托盘
         self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
@@ -553,19 +572,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
         if not self._tray_icon:
             import pystray
-            from PIL import Image, ImageDraw
 
-            # 1. 动态绘制一个极速、极简、高阶科技感的 64x64 正方形渐变 Logo 图标
-            # - 它是全动态生成的，不需要外部搭载静态 .ico 文件，打包出来的 exe 也会极度纯净
-            # - 采用与 THEME["primary"] 相同的科技紫色 `#7c6ef0`
-            # - 提示：在 Windows 任务栏系统托盘中，RGBA 的透明底色必须转换成 RGB 或有实体底色的遮罩，否则 Windows 托盘会渲染失败显示为透明空白占位。
-            # - 解决方案：我们为图标绘制一个极具现代感、咬合深色/浅色状态栏的圆角边框实体深色背景。
-            img = Image.new("RGB", (64, 64), (26, 27, 46)) # 采用与软件底色 THEME["bg"] (1a1b2e) 完全契合的优雅蓝黑色背景
-            draw = ImageDraw.Draw(img)
-            # 绘制带有科技质感、圆角的紫色火箭内核图形
-            draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#7c6ef0")
-            # 绘制白色的中央科技能量圆环
-            draw.ellipse([20, 24, 44, 44], fill="#f0f1f8")
+            # 使用统一绘制的高颜值科技图标
+            img = self._create_app_icon()
 
             def _show_app(icon, item):
                 """双击或者右键菜单点击‘显示主界面’时，将窗口复原并最前展示"""
