@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test/cache artifacts
+.pytest_cache/
+
+# Harness runtime noise
+.agent/logs/safe-run.log
+
+# Desktop tool local state
+data/*.json
+
+# Platform-specific local config
+.codex/
+
+# PyInstaller build artifacts
+build/
+dist/
