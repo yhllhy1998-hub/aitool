@@ -1,20 +1,24 @@
-task_id: aitool-desktop-tool-milestone-2
-current_table: desktop_tool_milestone_2
-stage: 5条需求全部实现完成
-status: completed
+task_id: aitool-lightweight-cleanup
+current_table: lightweight_cleanup
+stage: 轻量化重构
+status: in_progress
 task_type: deliverable
-actor: master-controller
-controller_thread_id: ses_0bb634075ffe5DR1HodmDLWQuB
-controller_thread_id_legacy: 019f3a9b-9dfd-74a0-97eb-820fb8f94ac5
+priority_level: 主线必解
+actor: aitool-master-controller
 allow_write:
+  - AGENTS.md
   - docs/
   - .agent/
-  - tests/
   - src/
+  - tests/
   - run_desktop_tool.py
-  - .gitignore
-  - data/
-history_note: 第四里程碑(svn update受控执行)+第五里程碑(UI可视化模块编辑)已完成。5条需求全部实现：1.中转站 2.覆盖复制 3.bat启动 4.svn update 5.自定义模块。单测29/29，治理36/36
-next_step: 等待用户验收全部5条需求；验收通过后评估exe打包固化
+next_step: >
+  轻量化重构已完成。下一步：修复 2 个测试 failure，刷新状态文件，
+  用户验收后推进 EXE 打包固化。
 override:
   enabled: false
+history_note: >
+  2026-07-12 轻量化重构：删除母仓特定基建（send_msg/controller-registry/practice-registry/
+  skill-governance/self-evolution-architecture）、无关脚本（website_probe）、过期文档。
+  .agent/ 从 26 文件降到 13，handbook 从 406 行降到 43 行。
+  保留核心三件套 + 护栏 + 打包脚本。

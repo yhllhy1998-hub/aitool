@@ -1,89 +1,59 @@
-# AiTool — AGENTS.md
+# AGENTS.md
 
-**Project identity:** Formal project + harness practice project. Owner: `Codex`. Master controller thread: `019f3a9b-9dfd-74a0-97eb-820fb8f94ac5`.
+AiTool 是一个 Windows 桌面效率工具，解决日常文件中转、文件夹覆盖复制、脚本启动和 SVN 操作的效率问题。
 
-## Quick Commands
+## 1. 项目结构
 
-```bash
-# Run tests (39 tests, 2 currently expected to fail)
-python -m pytest tests/ -v
+- 代码：`src/aitool_desktop/`（app / operations / models / storage）
+- 入口：`run_desktop_tool.py`
+- 治理：`.agent/`（轻量，单主控模式）
+- 文档：`docs/`
 
-# Run single test file
-python -m pytest tests/test_desktop_tool_logic.py -v
+## 2. 主控
 
-# Run desktop tool (src layout, requires deps)
-pip install customtkinter tkinterdnd2 pystray Pillow keyboard
-python run_desktop_tool.py
+单主控模式。主控职责见 `docs/master-controller-handbook.md`。
 
-# Build single-file exe (PyInstaller + UPX)
-pyinstaller --clean --noconfirm --onefile --windowed \
-  --add-data "src/aitool_desktop;src/aitool_desktop" \
-  --exclude-module numpy --exclude-module matplotlib \
-  --exclude-module scipy --exclude-module xml \
-  --exclude-module multiprocessing \
-  --name "AiTool" run_desktop_tool.py
-```
+主控负责：对齐意图、定义边界、证据验收、反熵收束。
+主控不是默认执行者。
 
-## Architecture (5 layers)
+## 3. 任务分型
 
-| Layer | Purpose | Key Files |
-|-------|---------|-----------|
-| **Master Control** | Task definition, risk gates, acceptance | `.agent/state/active-task.yaml`, `.agent/state/controller-registry.json`, `docs/master-controller-handbook.md` |
-| **Execution** | Run commands, mutate files, emit artifacts | `.agent/scripts/safe_run.py`, `.agent/hooks/dangerous_cmd.py`, `.agent/hooks/write_scope_gate.py`, `.agent/common/task_state.py` |
-| **Evidence** | Verify deliverable tasks only | `.agent/scripts/verify_outputs.py`, `.agent/state/last-verification.json` |
-| **Governance** | Local rules > external skills | `.agent/scripts/check_governance.py`, `.agent/state/skill-governance.json`, `.agent/state/practice-registry.json` |
-| **Project Drive** | Version plan, acceptance, status log | `docs/version-plan.md`, `docs/delivery-acceptance.md`, `.agent/logs/trial-status.md` |
+- `exploratory`：探路、验证假设。不要求证据。
+- `deliverable`：边界明确、要 claim done/fixed。走验证出口。
 
-## Task Types (critical distinction)
+## 4. 护栏
 
-- **exploratory** — Clarification, path comparison, risk validation. No pass/fail evidence required.
-- **deliverable** — Milestone delivery, must claim `done`/`fixed`/`passed`. Enters verification gate.
+- 危险命令拦截：`.agent/hooks/dangerous_cmd.py`
+- 路径写入门控：`.agent/hooks/write_scope_gate.py`
+- 受控执行：`.agent/scripts/safe_run.py`
 
-Only `deliverable` tasks pass through `.agent/scripts/verify_outputs.py`.
+## 5. 验证
 
-## State Files (source of truth)
+交付验证入口：`.agent/scripts/verify_outputs.py`
+治理体检入口：`.agent/scripts/check_governance.py`
 
-| File | Role |
-|------|------|
-| `.agent/state/active-task.yaml` | Current task card (task_id, stage, task_type, actor, allow_write[], override) |
-| `.agent/state/controller-registry.json` | Project owner, master thread, goal |
-| `.agent/state/runtime-state.json` | Last command, failure count, last verification |
-| `.agent/state/last-verification.json` | Last deliverable verification result |
-| `.agent/state/skill-governance.json` | Local governance priority, skill allow/deny lists |
-| `.agent/state/practice-registry.json` | Project role, positioning docs, governance contracts |
+验收基于真实证据，不接受表层成功信号。
 
-## Guards (enforced by hooks)
+## 6. 不做
 
-- **Dangerous commands** (`git reset --hard`, `rm -rf`, `git push --force`, etc.) → blocked globally
-- **Protected paths** (`assets/`, `baseline/`, `fixtures/`, `samples/`, `input/`, `templates/`, `source-of-truth/`) → blocked for executor; master-controller can override via `allow_write`
+- 多 session 协作
+- 自动编排系统
+- 完整 owner/subagent 编排
+- mode engine / 多模型 verifier
 
-## Desktop Tool (src/aitool_desktop/)
+## 7. 相关文档
 
-| Module | Responsibility |
-|--------|----------------|
-| `app.py` | CustomTkinter UI, drag-drop, tray, hotkeys (Alt+A), card execution |
-| `models.py` | `StationEntry`, `CustomModule`, `ActionReview` dataclasses |
-| `operations.py` | Core ops: folder-copy (2-channel), bat launch, SVN update/commit, web open, app launch |
-| `storage.py` | JSON persistence for station entries + custom modules |
+- 架构：`docs/project-architecture.md`
+- 验收标准：`docs/delivery-acceptance.md`
+- 版本规划：`docs/version-plan.md`
+- 主控手册：`docs/master-controller-handbook.md`
+- 试错日志：`.agent/logs/trial-status.md`
+- 活动任务：`.agent/state/active-task.yaml`
+- 运行时状态：`.agent/state/runtime-state.json`
+- 最近验证：`.agent/state/last-verification.json`
 
-**Key behavior:** Drag any file/URL → auto-classifies to station (files) or action card (scripts, .exe/.lnk, URLs). Right-click station entry → open containing folder. Double-click → open with system association.
+## 8. 常用命令
 
-## Testing Notes
-
-- No `pyproject.toml` / `requirements.txt` — deps installed manually per README
-- Test discovery: `tests/test_*.py` (uses `REPO_ROOT / "src"` on sys.path)
-- 2 known failing tests (nested path check in folder-copy, SVN validate status) — reflect current implementation gaps, not test errors
-
-## Conventions
-
-- **Python ≥ 3.10**, type hints (`from __future__ import annotations`), `pathlib.Path` throughout
-- **No external config files** — all governance state in `.agent/state/*.json|yaml`
-- **Low-dependency core** — `.agent/common/task_state.py` reads YAML without PyYAML
-- **Harness first** — stable practices extracted *after* real delivery, not before
-
-## References
-
-- `docs/project-architecture.md` — full layer diagram
-- `docs/master-controller-handbook.md` — master control procedures
-- `docs/delivery-acceptance.md` — acceptance scenarios & minimum pass criteria
-- `AGENTS.md` (this file) — agent-facing quick reference
+- 安装依赖：`pip install PyQt5 pyinstaller`
+- 运行测试：`python -m pytest tests/ -v`
+- 构建可执行：`pyinstaller --noconfirm --onefile --windowed --name "AiTool桌面工具" run_desktop_tool.py`
