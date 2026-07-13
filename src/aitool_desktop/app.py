@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
 
+from .input_parsing import parse_input
 from .models import ActionReview, CustomModule, MODULE_TYPES, StationEntry
 from .operations import (
     build_folder_copy_dry_run,
@@ -1066,132 +1067,20 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         raw_data: 原始文本数据
         paths_source: 拖拽时的 event.data（用于 tk.splitlist 解析文件路径），粘贴时为 None
         """
-        if not raw_data:
+        splitlist = self.tk.splitlist if paths_source is not None else None
+        result = parse_input(raw_data, paths_source, splitlist=splitlist)
+        if result is None:
             return
 
-        added_modules = []
-        added_station = []
-
-        import re
-        url_match = re.search(r'(https?://[^\s"\'{}<>]+)', raw_data)
-
-        cleaned_raw = raw_data.strip("{}'\" ")
-        url_match_loose = re.search(r'(https?://[^\s"\'{}<>]+)', cleaned_raw)
-
-        if url_match_loose:
-            extracted_url = url_match_loose.group(1)
-            name = "打开网页 " + (extracted_url[:25] + "..." if len(extracted_url) > 25 else extracted_url)
-            module = CustomModule(
-                module_id=ModuleStorage.generate_id(),
-                name=name,
-                module_type="open-web",
-                params={"url": extracted_url},
-            )
-            self.custom_modules.append(module)
-            added_modules.append(name)
-        elif cleaned_raw.lower().startswith("www."):
-            full_url = "https://" + cleaned_raw
-            name = "打开 " + cleaned_raw
-            module = CustomModule(
-                module_id=ModuleStorage.generate_id(),
-                name=name,
-                module_type="open-web",
-                params={"url": full_url},
-            )
-            self.custom_modules.append(module)
-            added_modules.append(name)
-        elif ";" in raw_data and (raw_data.count(":") >= 2 or "/" in raw_data or "\\" in raw_data):
-            parts = [p.strip() for p in raw_data.split(";")]
-            valid_dirs = [p for p in parts if Path(p).exists() and Path(p).is_dir()]
-            if len(valid_dirs) >= 2:
-                name = "多路径覆盖复制"
-                module = CustomModule(
-                    module_id=ModuleStorage.generate_id(),
-                    name=name,
-                    module_type="folder-copy",
-                    params={"source": ";".join(valid_dirs), "target": ""},
-                )
-                self.custom_modules.append(module)
-                added_modules.append(name)
-        else:
-            if paths_source is not None:
-                paths = list(self.tk.splitlist(paths_source))
-            else:
-                paths = [raw_data]
-            if not paths:
-                return
-
-            for raw_path in paths:
-                p = Path(raw_path)
-                if p.suffix.lower() == ".url":
-                    try:
-                        url_val = ""
-                        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                            for line in f:
-                                if line.strip().lower().startswith("url="):
-                                    url_val = line.split("=", 1)[1].strip()
-                                    break
-                        if url_val:
-                            name = "打开 " + p.stem
-                            module = CustomModule(
-                                module_id=ModuleStorage.generate_id(),
-                                name=name,
-                                module_type="open-web",
-                                params={"url": url_val},
-                            )
-                            self.custom_modules.append(module)
-                            added_modules.append(name)
-                            continue
-                    except Exception:
-                        pass
-
-                if not p.exists():
-                    raw_lower = raw_path.strip().lower()
-                    if raw_lower.startswith("www."):
-                        full_url = "https://" + raw_path.strip()
-                        name = "打开 " + raw_path.strip()
-                        module = CustomModule(
-                            module_id=ModuleStorage.generate_id(),
-                            name=name,
-                            module_type="open-web",
-                            params={"url": full_url},
-                        )
-                        self.custom_modules.append(module)
-                        added_modules.append(name)
-                        continue
-                    continue
-
-                ext = p.suffix.lower()
-                if ext in {".exe", ".lnk"}:
-                    name = "启动 " + (p.stem if ext == ".lnk" else p.name)
-                    module = CustomModule(
-                        module_id=ModuleStorage.generate_id(),
-                        name=name,
-                        module_type="app-launch",
-                        params={"app_path": str(p), "work_dir": "", "args": ""},
-                    )
-                    self.custom_modules.append(module)
-                    added_modules.append(name)
-                elif ext in {".bat", ".cmd", ".py"}:
-                    name = "执行 " + p.name
-                    module = CustomModule(
-                        module_id=ModuleStorage.generate_id(),
-                        name=name,
-                        module_type="launch-bat",
-                        params={"script": str(p)},
-                    )
-                    self.custom_modules.append(module)
-                    added_modules.append(name)
-                else:
-                    added_station.append(raw_path)
-
-        if added_modules:
+        if result.modules:
+            self.custom_modules.extend(result.modules)
             self.module_storage.save(self.custom_modules)
             self._refresh_cards()
-            self._toast(f"已自动生成模块: {', '.join(added_modules)}", "success")
+            names = [m.name for m in result.modules]
+            self._toast(f"已自动生成模块: {', '.join(names)}", "success")
 
-        if added_station:
-            self.entries, added_s, skipped = collect_station_entries(added_station, self.entries)
+        if result.station_paths:
+            self.entries, added_s, skipped = collect_station_entries(result.station_paths, self.entries)
             self.station_storage.save(self.entries)
             self._refresh_station()
             if added_s:
