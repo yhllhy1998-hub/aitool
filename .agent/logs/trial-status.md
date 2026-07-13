@@ -49,7 +49,7 @@
 - 模块存储到 data/custom_modules.json
 
 ### exe 打包链路固化
-- 打包脚本：`.agent/scripts/build_exe.py`
+- 打包入口：`AiTool桌面工具.spec`（PyInstaller spec 文件）
 - 固化 PyInstaller 参数：--collect-submodules tkinter + --hidden-import stdlib 模块
 - 入口脚本 run_desktop_tool.py 顶部显式 import json/uuid 确保 PyInstaller 追踪
 - 验证：exe 生成成功（12.1MB），启动存活8秒未崩溃

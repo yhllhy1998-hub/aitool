@@ -10,7 +10,7 @@ from ctypes import wintypes
 
 from PIL import Image, ImageTk
 import customtkinter as ctk
-from tkinterdnd2 import DND_FILES, TkinterDnD
+from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
 
 from .models import ActionReview, CustomModule, MODULE_TYPES, StationEntry
 from .operations import (
@@ -359,11 +359,26 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._card_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _init_storage(self) -> None:
+        self._ensure_default_config()
         self.station_storage = StationStorage(STATE_PATH)
         self.module_storage = ModuleStorage(MODULE_STATE_PATH)
         self.entries: list[StationEntry] = self.station_storage.load()
         self.custom_modules: list[CustomModule] = self.module_storage.load()
         self.quick_actions = self._load_quick_actions()
+
+    def _ensure_default_config(self) -> None:
+        """首次运行时，从打包内置的 data 目录复制默认配置到用户持久化目录 (APPDATA)。"""
+        if DATA_DIR.exists() and any(DATA_DIR.iterdir()):
+            return
+        builtin_data = REPO_ROOT / "data"
+        if not builtin_data.exists():
+            return
+        import shutil
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        for src in builtin_data.iterdir():
+            dst = DATA_DIR / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
 
     def _load_quick_actions(self) -> list[dict]:
         data = _load_json(QUICK_ACTIONS_PATH, {})
@@ -680,6 +695,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._build_station_area()
         self._build_card_area()
         self._build_statusbar()
+
+        self.bind_all("<Control-v>", self._on_paste)
 
     def _build_station_area(self) -> None:
         wrap = ctk.CTkFrame(self._card_inner, fg_color=THEME["surface"], corner_radius=0)
@@ -1019,24 +1036,40 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _on_global_drag_leave(self, event) -> None:
         self._set_status("就绪", "ready")
 
+    def _on_paste(self, event=None) -> None:
+        """Ctrl+V 粘贴：读取剪贴板内容，智能识别网址或文件路径并添加模块。"""
+        try:
+            raw_data = self.clipboard_get().strip()
+        except Exception:
+            return
+        if not raw_data:
+            return
+        self._set_status("粘贴添加...", "warning")
+        self._process_input_data(raw_data, paths_source=None)
+
     def _on_global_drop(self, event) -> None:
-        # 支持两种拖拽方式：
-        # 1. 拖入来自浏览器的原生链接 URL、或者剪贴板/选中的文本（通过 event.data 文本智能正则判定）
-        # 2. 拖入 Windows 本地文件（通过 tk.splitlist(event.data) 分割后的真实路径）
         raw_data = str(event.data).strip()
-        
+        paths_source = event.data
+        self._process_input_data(raw_data, paths_source)
+
+    def _process_input_data(self, raw_data: str, paths_source=None) -> None:
+        """智能识别并添加模块/收藏。拖拽和粘贴共用此逻辑。
+
+        raw_data: 原始文本数据
+        paths_source: 拖拽时的 event.data（用于 tk.splitlist 解析文件路径），粘贴时为 None
+        """
+        if not raw_data:
+            return
+
         added_modules = []
         added_station = []
 
-        # 用正则表达式与前缀检测对整个拖入的 event.data 进行“纯网址/文本超链接”检测
-        # 支持各种形式：带引号、不带引号，或者包含 http://, https:// 的独立字符串
         import re
         url_match = re.search(r'(https?://[^\s"\'{}<>]+)', raw_data)
-        
-        # 额外针对拖入可能带大括号包围的网址（如 {https://github.com}）进行剥离
+
         cleaned_raw = raw_data.strip("{}'\" ")
         url_match_loose = re.search(r'(https?://[^\s"\'{}<>]+)', cleaned_raw)
-        
+
         if url_match_loose:
             extracted_url = url_match_loose.group(1)
             name = "打开网页 " + (extracted_url[:25] + "..." if len(extracted_url) > 25 else extracted_url)
@@ -1049,7 +1082,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.custom_modules.append(module)
             added_modules.append(name)
         elif cleaned_raw.lower().startswith("www."):
-            # 兼容无协议头的普通网址，如 www.baidu.com
             full_url = "https://" + cleaned_raw
             name = "打开 " + cleaned_raw
             module = CustomModule(
@@ -1061,9 +1093,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.custom_modules.append(module)
             added_modules.append(name)
         elif ";" in raw_data and (raw_data.count(":") >= 2 or "/" in raw_data or "\\" in raw_data):
-            # 额外兼容：如果拖入的字符串是用半角分号分割的多个路径，智能建立多路径文件覆盖拷贝
             parts = [p.strip() for p in raw_data.split(";")]
-            # 如果拖入两个或多个存在的文件夹
             valid_dirs = [p for p in parts if Path(p).exists() and Path(p).is_dir()]
             if len(valid_dirs) >= 2:
                 name = "多路径覆盖复制"
@@ -1076,14 +1106,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.custom_modules.append(module)
                 added_modules.append(name)
         else:
-            # 如果不包含 http 开头的网络地址，我们退回经典的文件路径分割和智能识别
-            paths = list(self.tk.splitlist(event.data))
+            if paths_source is not None:
+                paths = list(self.tk.splitlist(paths_source))
+            else:
+                paths = [raw_data]
             if not paths:
                 return
 
             for raw_path in paths:
                 p = Path(raw_path)
-                # 兼容 Windows 经典 .url 快捷配置文件
                 if p.suffix.lower() == ".url":
                     try:
                         url_val = ""
@@ -1107,7 +1138,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         pass
 
                 if not p.exists():
-                    # 额外兼容：如果路径不存在，但是包含了诸如 www.baidu.com 等经典无头网址文本
                     raw_lower = raw_path.strip().lower()
                     if raw_lower.startswith("www."):
                         full_url = "https://" + raw_path.strip()
@@ -1122,10 +1152,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         added_modules.append(name)
                         continue
                     continue
-                    
+
                 ext = p.suffix.lower()
                 if ext in {".exe", ".lnk"}:
-                    # 智能归类为：打开应用模块
                     name = "启动 " + (p.stem if ext == ".lnk" else p.name)
                     module = CustomModule(
                         module_id=ModuleStorage.generate_id(),
@@ -1136,7 +1165,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.custom_modules.append(module)
                     added_modules.append(name)
                 elif ext in {".bat", ".cmd", ".py"}:
-                    # 智能归类为：启动脚本模块
                     name = "执行 " + p.name
                     module = CustomModule(
                         module_id=ModuleStorage.generate_id(),
@@ -1147,22 +1175,20 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.custom_modules.append(module)
                     added_modules.append(name)
                 else:
-                    # 其他所有格式（如 .zip, .xlsx, .png，或普通文件夹）：智能收藏到文件站
                     added_station.append(raw_path)
 
-        # 批量保存与视图重刷
         if added_modules:
             self.module_storage.save(self.custom_modules)
             self._refresh_cards()
             self._toast(f"已自动生成模块: {', '.join(added_modules)}", "success")
-            
+
         if added_station:
             self.entries, added_s, skipped = collect_station_entries(added_station, self.entries)
             self.station_storage.save(self.entries)
             self._refresh_station()
             if added_s:
                 self._toast(f"已收藏到中转站: {', '.join(added_s)}", "success")
-                
+
         self._set_status("就绪", "ready")
 
     def _on_station_drag_out(self, entry: StationEntry):

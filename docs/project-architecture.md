@@ -26,7 +26,6 @@ run_desktop_tool.py  # PyInstaller 入口
     safe_run.py            # 受控执行入口
     verify_outputs.py      # 交付验证
     check_governance.py    # 治理体检
-    build_exe.py           # EXE 打包
   state/
     active-task.yaml       # 当前任务
     runtime-state.json     # 运行时状态

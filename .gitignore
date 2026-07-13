@@ -16,3 +16,14 @@ data/.user_guide_seen
 build/
 dist/
 *.spec
+!AiTool桌面工具.spec
+
+# Local analysis and orchestration state
+.repowise/
+.slim/deepwork/
+
+# Local AI/editor configuration
+.claude/
+.mcp.json
+.opencode/
+.vscode/

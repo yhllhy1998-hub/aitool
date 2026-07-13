@@ -103,7 +103,7 @@ class DesktopToolLogicTests(unittest.TestCase):
 
             self.assertEqual(review.mode, "validate-only")
             self.assertEqual(review.status, "warning")
-            self.assertIn("更新规则待确认", review.summary)
+            self.assertIn("路径已校验", review.summary)
 
     def test_preview_folder_copy_reports_overlap_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

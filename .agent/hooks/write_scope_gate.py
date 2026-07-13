@@ -8,11 +8,142 @@ from typing import Final
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACTIVE_TASK = REPO_ROOT / ".agent" / "state" / "active-task.yaml"
-COMMON_DIR = REPO_ROOT / ".agent" / "common"
-if str(COMMON_DIR) not in sys.path:
-    sys.path.insert(0, str(COMMON_DIR))
 
-from task_state import load_task_state
+
+def _simple_yaml_load(text: str) -> dict:
+    """Minimal YAML parser for active-task.yaml structure.
+
+    Handles: simple key:value, lists with '- item', nested dicts,
+    multi-line strings with '>', and empty lines.
+    Does NOT handle: anchors, aliases, flow style, complex block scalars.
+    """
+    result: dict = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # skip empty lines and comments
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        # detect top-level key: value
+        colon = stripped.find(":")
+        if colon == -1:
+            i += 1
+            continue
+        key = stripped[:colon].strip()
+        after_colon = stripped[colon + 1:].strip()
+        # multi-line string with > or |
+        if after_colon in (">", "|"):
+            value = _consume_block_scalar(lines, i + 1)
+            result[key] = value
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith(("  ", "\t")):
+                i += 1
+            continue
+        if after_colon:
+            # simple scalar value
+            result[key] = _coerce_value(after_colon)
+            i += 1
+        else:
+            # key with no immediate value: look ahead for list or nested dict
+            i, value = _consume_nested(lines, i + 1)
+            result[key] = value
+            continue
+    return result
+
+
+def _coerce_value(raw: str) -> object:
+    if raw.lower() == "true":
+        return True
+    if raw.lower() == "false":
+        return False
+    if raw.lower() == "null" or raw == "~":
+        return None
+    # try int then float
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    # strip quotes
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        return raw[1:-1]
+    return raw
+
+
+def _consume_block_scalar(lines: list[str], start: int) -> str:
+    segments: list[str] = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            if segments:
+                segments.append("")
+            i += 1
+            continue
+        if line.startswith(("  ", "\t")):
+            segments.append(line.strip())
+            i += 1
+        else:
+            break
+    return " ".join(segments)
+
+
+def _consume_nested(lines: list[str], start: int) -> tuple[int, object]:
+    """Consume either a list of '- item' lines or nested key:value dict."""
+    i = start
+    while i < len(lines) and (not lines[i].strip() or lines[i].strip().startswith("#")):
+        i += 1
+    if i >= len(lines):
+        return i, []
+
+    first_line = lines[i]
+    first_stripped = first_line.strip()
+    if first_stripped.startswith("- "):
+        # list
+        items: list = []
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+            if stripped.startswith("- "):
+                items.append(_coerce_value(stripped[2:].strip()))
+                i += 1
+            else:
+                break
+        return i, items
+    else:
+        # nested dict
+        nested: dict = {}
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+            colon = stripped.find(":")
+            if colon == -1:
+                break
+            key = stripped[:colon].strip()
+            after = stripped[colon + 1:].strip()
+            if after in (">", "|"):
+                nested[key] = _consume_block_scalar(lines, i + 1)
+                i += 1
+                while i < len(lines) and lines[i].strip().startswith(("  ", "\t")):
+                    i += 1
+            elif after:
+                nested[key] = _coerce_value(after)
+                i += 1
+            else:
+                # nested key with no immediate value
+                i, sub_value = _consume_nested(lines, i + 1)
+                nested[key] = sub_value
+        return i, nested
 PROTECTED_PATH_PREFIXES: Final[tuple[str, ...]] = (
     "assets/",
     "baseline/",
@@ -43,7 +174,8 @@ def normalize_rel(path: str) -> str:
 
 
 def load_active_task() -> dict:
-    return load_task_state(ACTIVE_TASK)
+    raw = ACTIVE_TASK.read_text(encoding="utf-8")
+    return _simple_yaml_load(raw)
 
 
 def matches_scope(target: str, allowed: str) -> bool:

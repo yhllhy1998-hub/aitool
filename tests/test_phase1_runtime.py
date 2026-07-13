@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import subprocess
 import unittest
@@ -14,7 +13,6 @@ LAST_VERIFICATION = REPO_ROOT / ".agent" / "state" / "last-verification.json"
 DANGEROUS_CMD = REPO_ROOT / ".agent" / "hooks" / "dangerous_cmd.py"
 WRITE_SCOPE_GATE = REPO_ROOT / ".agent" / "hooks" / "write_scope_gate.py"
 VERIFY_OUTPUTS = REPO_ROOT / ".agent" / "scripts" / "verify_outputs.py"
-TASK_STATE_MODULE = REPO_ROOT / ".agent" / "common" / "task_state.py"
 
 
 def run_python(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -25,14 +23,6 @@ def run_python(script: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
-
-
-def load_task_state_module():
-    spec = importlib.util.spec_from_file_location("task_state", TASK_STATE_MODULE)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 class Phase1RuntimeTests(unittest.TestCase):
@@ -138,27 +128,6 @@ class Phase1RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "failed")
-
-    def test_task_state_fallback_parser_handles_current_schema(self) -> None:
-        module = load_task_state_module()
-        payload = module._simple_yaml_load(
-            "\n".join(
-                [
-                    "task_id: sample",
-                    "stage: verify",
-                    "task_type: deliverable",
-                    "allow_write:",
-                    "  - docs/",
-                    "  - .agent/",
-                    "override:",
-                    "  enabled: false",
-                    "",
-                ]
-            )
-        )
-        self.assertEqual(payload["task_id"], "sample")
-        self.assertEqual(payload["allow_write"], ["docs/", ".agent/"])
-        self.assertEqual(payload["override"]["enabled"], False)
 
 
 if __name__ == "__main__":

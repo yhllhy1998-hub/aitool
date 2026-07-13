@@ -13,8 +13,8 @@ allow_write:
   - tests/
   - run_desktop_tool.py
 next_step: >
-  轻量化重构已完成。下一步：修复 2 个测试 failure，刷新状态文件，
-  用户验收后推进 EXE 打包固化。
+  轻量化清理已完成：移除已删除文件的残余测试、修复 write_scope_gate 硬依赖、
+  删除冲突的 build_exe.py、清理过时引用。验证测试与治理检查已通过，下一步：创建清理提交。
 override:
   enabled: false
 history_note: >

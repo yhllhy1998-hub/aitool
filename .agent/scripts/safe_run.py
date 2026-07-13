@@ -15,12 +15,6 @@ RUNTIME_STATE = STATE_DIR / "runtime-state.json"
 DANGEROUS_HOOK = REPO_ROOT / ".agent" / "hooks" / "dangerous_cmd.py"
 SCOPE_HOOK = REPO_ROOT / ".agent" / "hooks" / "write_scope_gate.py"
 SAFE_RUN_LOG = LOG_DIR / "safe-run.log"
-COMMON_DIR = REPO_ROOT / ".agent" / "common"
-if str(COMMON_DIR) not in sys.path:
-    sys.path.insert(0, str(COMMON_DIR))
-
-from task_state import load_task_state
-
 DEFAULT_RUNTIME = {
     "task_id": "unknown-task",
     "failure_count": 0,
@@ -34,8 +28,132 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+# ---------------------------------------------------------------------------
+# Minimal YAML parser for active-task.yaml (copied from write_scope_gate.py)
+# ---------------------------------------------------------------------------
+
+def _coerce_value(raw: str) -> object:
+    if raw.lower() == "true":
+        return True
+    if raw.lower() == "false":
+        return False
+    if raw.lower() == "null" or raw == "~":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        return raw[1:-1]
+    return raw
+
+
+def _consume_block_scalar(lines: list[str], start: int) -> str:
+    segments: list[str] = []
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            if segments:
+                segments.append("")
+            i += 1
+            continue
+        if line.startswith(("  ", "\t")):
+            segments.append(line.strip())
+            i += 1
+        else:
+            break
+    return " ".join(segments)
+
+
+def _consume_nested(lines: list[str], start: int) -> tuple[int, object]:
+    i = start
+    while i < len(lines) and (not lines[i].strip() or lines[i].strip().startswith("#")):
+        i += 1
+    if i >= len(lines):
+        return i, []
+
+    first_stripped = lines[i].strip()
+    if first_stripped.startswith("- "):
+        items: list = []
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+            if stripped.startswith("- "):
+                items.append(_coerce_value(stripped[2:].strip()))
+                i += 1
+            else:
+                break
+        return i, items
+    else:
+        nested: dict = {}
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if not stripped or stripped.startswith("#"):
+                i += 1
+                continue
+            colon = stripped.find(":")
+            if colon == -1:
+                break
+            key = stripped[:colon].strip()
+            after = stripped[colon + 1:].strip()
+            if after in (">", "|"):
+                nested[key] = _consume_block_scalar(lines, i + 1)
+                i += 1
+                while i < len(lines) and lines[i].strip().startswith(("  ", "\t")):
+                    i += 1
+            elif after:
+                nested[key] = _coerce_value(after)
+                i += 1
+            else:
+                i, sub_value = _consume_nested(lines, i + 1)
+                nested[key] = sub_value
+        return i, nested
+
+
+def _simple_yaml_load(text: str) -> dict:
+    result: dict = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        colon = stripped.find(":")
+        if colon == -1:
+            i += 1
+            continue
+        key = stripped[:colon].strip()
+        after_colon = stripped[colon + 1:].strip()
+        if after_colon in (">", "|"):
+            result[key] = _consume_block_scalar(lines, i + 1)
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith(("  ", "\t")):
+                i += 1
+            continue
+        if after_colon:
+            result[key] = _coerce_value(after_colon)
+            i += 1
+        else:
+            i, value = _consume_nested(lines, i + 1)
+            result[key] = value
+            continue
+    return result
+
+
 def read_active_task() -> dict:
-    return load_task_state(ACTIVE_TASK)
+    if not ACTIVE_TASK.exists():
+        return {}
+    raw = ACTIVE_TASK.read_text(encoding="utf-8")
+    return _simple_yaml_load(raw)
 
 
 def read_json(path: Path, fallback: dict) -> dict:

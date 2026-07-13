@@ -117,6 +117,11 @@ def _validate_folder_copy_paths(source: Path | None, target: Path | None) -> tup
     if resolved_source is not None and resolved_source == resolved_target:
         errors.append("来源目录与目标目录不能相同。")
 
+    if resolved_source is not None and (
+        _is_relative_to(resolved_target, resolved_source) or _is_relative_to(resolved_source, resolved_target)
+    ):
+        errors.append("来源目录与目标目录存在包含关系，不允许复制。")
+
     if errors:
         return None, None, errors
     return resolved_source, resolved_target, []
