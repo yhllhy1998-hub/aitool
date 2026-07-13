@@ -30,12 +30,17 @@ from .storage import ModuleStorage, StationStorage
 
 
 if getattr(sys, "frozen", False):
+    # 打包运行：为了保证用户添加的卡片和暂存文件在重启、重打包或覆盖后绝不丢失，
+    # 存储路径应当设在用户本地的应用持久化目录 (APPDATA)，而不是只读的临时释放目录 sys._MEIPASS 内！
     REPO_ROOT = Path(sys._MEIPASS)
+    DATA_DIR = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "AiTool"
 else:
     REPO_ROOT = Path(__file__).resolve().parents[2]
-STATE_PATH = REPO_ROOT / "data" / "document_station_entries.json"
-MODULE_STATE_PATH = REPO_ROOT / "data" / "custom_modules.json"
-QUICK_ACTIONS_PATH = REPO_ROOT / "data" / "quick_actions.json"
+    DATA_DIR = REPO_ROOT / "data"
+
+STATE_PATH = DATA_DIR / "document_station_entries.json"
+MODULE_STATE_PATH = DATA_DIR / "custom_modules.json"
+QUICK_ACTIONS_PATH = DATA_DIR / "quick_actions.json"
 DEFAULT_EXPORT_BAT = Path(r"F:\F_tunk\工具_指定配置文件导出.bat")
 DEFAULT_SVN_ROOT = Path(r"F:\F_tunk")
 
@@ -1718,7 +1723,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     # ============================================================
     def _show_user_guide(self, manual: bool = False) -> None:
         """弹出精致的极客用户使用说明。支持检测‘首次启动文件标志’，如果是首次启动，则静默自动弹窗。"""
-        flag_file = REPO_ROOT / "data" / ".user_guide_seen"
+        flag_file = DATA_DIR / ".user_guide_seen"
         if not manual and flag_file.exists():
             # 自动检测时：如果已经看过，则不打扰用户
             return
