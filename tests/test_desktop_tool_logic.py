@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -229,10 +230,37 @@ class DesktopToolLogicTests(unittest.TestCase):
             workspace.mkdir()
             (workspace / ".svn").mkdir()
 
-            review = execute_svn_update(workspace)
+            with patch(
+                "aitool_desktop.operations._find_svn_executable",
+                return_value=(None, "none"),
+            ):
+                review = execute_svn_update(workspace)
 
             self.assertEqual(review.mode, "execute")
-            self.assertIn(review.status, ("blocked", "ready"))
+            self.assertEqual(review.status, "blocked")
+            self.assertIn("svn 客户端不可用", review.summary)
+
+    def test_execute_svn_update_tortoise_popen_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".svn").mkdir()
+
+            fake_exe = "C:\\Fake\\TortoiseProc.exe"
+            with patch(
+                "aitool_desktop.operations._find_svn_executable",
+                return_value=(fake_exe, "tortoise"),
+            ):
+                with patch("aitool_desktop.operations.subprocess.Popen") as mock_popen:
+                    review = execute_svn_update(workspace)
+
+            mock_popen.assert_called_once_with(
+                [fake_exe, "/command:update", f"/path:{workspace}", "/closeonend:0"],
+                shell=False,
+            )
+            self.assertEqual(review.mode, "execute")
+            self.assertEqual(review.status, "ready")
 
     def test_module_storage_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
