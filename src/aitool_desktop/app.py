@@ -28,6 +28,10 @@ from .operations import (
 )
 from .storage import ModuleStorage, StationStorage
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 if getattr(sys, "frozen", False):
     # 打包运行：为了保证用户添加的卡片和暂存文件在重启、重打包或覆盖后绝不丢失，
@@ -345,6 +349,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
         from tkinterdnd2 import DND_FILES, DND_TEXT
         self.drop_target_register(DND_FILES, DND_TEXT)
+        self.dnd_bind("<<Drop>>", self._on_global_drop)
         self._init_storage()
         self._init_window()
         self._build_ui()
@@ -1025,8 +1030,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             widget.dnd_bind("<<Drop>>", self._on_global_drop)
             widget.dnd_bind("<<DragEnter>>", self._on_global_drag_enter)
             widget.dnd_bind("<<DragLeave>>", self._on_global_drag_leave)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("_register_dnd_recursive skip %s: %s", type(widget).__name__, e)
         for child in widget.winfo_children():
             self._register_dnd_recursive(child)
 
@@ -1048,9 +1053,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._process_input_data(raw_data, paths_source=None)
 
     def _on_global_drop(self, event) -> None:
-        raw_data = str(event.data).strip()
-        paths_source = event.data
-        self._process_input_data(raw_data, paths_source)
+        try:
+            raw_data = str(event.data).strip()
+            paths_source = event.data
+            self._process_input_data(raw_data, paths_source)
+        except Exception:
+            logger.exception("_on_global_drop failed")
 
     def _process_input_data(self, raw_data: str, paths_source=None) -> None:
         """智能识别并添加模块/收藏。拖拽和粘贴共用此逻辑。
