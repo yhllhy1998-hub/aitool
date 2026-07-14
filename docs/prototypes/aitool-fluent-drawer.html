@@ -462,19 +462,22 @@
       --desktop-ink: #a6b2bc;
       --desktop-block: #2d353d;
       --desktop-block-dark: #303941;
-      --window: #1f252a;
-      --window-solid: #1f252a;
-      --surface: #252c32;
-      --surface-subtle: #20272c;
-      --surface-hover: #2b353c;
+      --window: #20262b;
+      --window-solid: #20262b;
+      --surface: #293137;
+      --surface-subtle: #242b30;
+      --surface-hover: #303a41;
       --surface-selected: #293e4c;
       --surface-disabled: #23282d;
       --line: #39434b;
       --line-strong: #4d5c67;
-      --ink: #e8edf0;
+      /* Dark text contrast pass: clear hierarchy without pure white or console-like contrast. */
+      --ink: #e2e8ec;
+      --ink-heading: #e5ebee;
       --ink-secondary: #bdc9d1;
       --ink-muted: #a7b4bd;
-      --ink-faint: #8e9da7;
+      --ink-faint: #909ea7;
+      --ink-support: #9dabb4;
       --accent: #8fb4cc;
       --accent-strong: #a9cce1;
       --accent-soft: #304957;
@@ -486,11 +489,39 @@
       --info-border: #557789;
       --status-text: #bdc9d1;
       --status-detail: #a7b4bd;
-      --status-faint: #8e9da7;
-      --disabled-text: #89969f;
-      --disabled-muted: #96a2aa;
+      --status-faint: #9aa8b1;
+      --disabled-text: #919ea6;
+      --disabled-muted: #9ca8af;
       --shadow: 0 20px 48px rgba(0, 0, 0, .35), 0 3px 10px rgba(0, 0, 0, .24);
     }
+    /* Keep every secondary surface explicit: inherited muted text was too quiet in dark mode. */
+    .theme-dark .section-title { color: var(--ink-heading); font-weight: 700; }
+    .theme-dark .section-description { color: var(--ink-secondary); }
+    .theme-dark .shell-icon-note { color: var(--ink-support); }
+    .theme-dark .window-context { color: var(--ink-secondary); }
+    .theme-dark .file-name,
+    .theme-dark .action-title { color: var(--ink); }
+    .theme-dark .file-path,
+    .theme-dark .file-detail,
+    .theme-dark .action-meta { color: var(--ink-secondary); }
+    .theme-dark .file-detail span,
+    .theme-dark .action-description,
+    .theme-dark .action-meta span { color: var(--ink-muted); }
+    .theme-dark .action-meta kbd { color: var(--ink-secondary); background: #2b343a; border-color: var(--line-strong); }
+    .theme-dark .statusbar { color: var(--status-text); }
+    .theme-dark .status-detail { color: var(--status-detail); }
+    .theme-dark .status-version,
+    .theme-dark .info-time { color: var(--status-faint); }
+    .theme-dark .station-drop { color: var(--drop-text); }
+    .theme-dark .drop-subtitle { color: var(--drop-muted); }
+    .theme-dark .drop-key { color: var(--ink-support); }
+    .theme-dark .info-bar { color: var(--info-text); }
+    .theme-dark .action-row.is-disabled .action-title { color: var(--disabled-text); }
+    .theme-dark .action-row.is-disabled .action-description,
+    .theme-dark .action-row.is-disabled .action-meta,
+    .theme-dark .action-row.is-disabled .action-meta span { color: var(--disabled-muted); }
+    .theme-dark .action-row.is-disabled .action-meta kbd,
+    .theme-dark .execute-button:disabled { color: var(--disabled-text); }
     .theme-dark .prototype-label { color: #b4c0c8; }
     .theme-dark .control-group { background: rgba(20, 24, 27, .25); border-color: rgba(200, 215, 224, .18); }
     .theme-dark .prototype-bar button { color: #b4c0c8; }
