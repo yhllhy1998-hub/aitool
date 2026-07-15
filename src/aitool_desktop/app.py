@@ -28,10 +28,156 @@ from .operations import (
     validate_svn_document_update_path,
 )
 from .storage import ModuleStorage, StationStorage
+from .station_ordering import normalize_path_key, remove_station_entry
+from .theme import ACTION_ICON_GLYPHS, parse_theme_mode, resolve_theme_mode, theme_tokens
+from .window_geometry import (
+    MIN_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH,
+    WorkArea,
+    load_and_place_window_geometry,
+    select_work_area,
+    save_window_geometry,
+    WindowGeometry,
+)
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+_DND_DIAGNOSTICS = {
+    "generation": 0,
+    "targets": {"attempted": 0, "succeeded": 0, "failed": 0},
+    "sources": {"attempted": 0, "succeeded": 0, "failed": 0},
+    "failures": [],
+}
+
+
+def reset_dnd_diagnostics() -> None:
+    """Reset observable drag-and-drop registration counters."""
+
+    _DND_DIAGNOSTICS["generation"] = 0
+    for kind in ("targets", "sources"):
+        _DND_DIAGNOSTICS[kind].update(attempted=0, succeeded=0, failed=0)
+    _DND_DIAGNOSTICS["failures"].clear()
+
+
+def get_dnd_diagnostics() -> dict:
+    """Return a detached snapshot of drag-and-drop registration health."""
+
+    return {
+        "generation": _DND_DIAGNOSTICS["generation"],
+        "targets": dict(_DND_DIAGNOSTICS["targets"]),
+        "sources": dict(_DND_DIAGNOSTICS["sources"]),
+        "failures": [dict(item) for item in _DND_DIAGNOSTICS["failures"]],
+    }
+
+
+def _dnd_widget_id(widget) -> str:
+    try:
+        return str(widget)
+    except Exception:
+        return f"{type(widget).__name__}@{id(widget):x}"
+
+
+def _record_dnd_registration(kind: str, widget, success: bool, error: Exception | None = None) -> None:
+    counters = _DND_DIAGNOSTICS["targets" if kind == "target" else "sources"]
+    counters["attempted"] += 1
+    if success:
+        counters["succeeded"] += 1
+        return
+
+    counters["failed"] += 1
+    failure = {
+        "widget_id": _dnd_widget_id(widget),
+        "kind": kind,
+        "error_type": type(error).__name__ if error is not None else "RegistrationError",
+        "error_message": str(error) if error is not None else "registration failed",
+    }
+    _DND_DIAGNOSTICS["failures"].append(failure)
+    logger.warning("DND %s registration failed for %s: %s", kind, failure["widget_id"], failure["error_message"])
+
+
+def _detect_system_effective_theme() -> str:
+    """Read the Windows preference without making startup depend on it."""
+
+    if os.name != "nt":
+        return "dark"
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            for value_name in ("AppsUseLightTheme", "SystemUsesLightTheme"):
+                try:
+                    value, _ = winreg.QueryValueEx(key, value_name)
+                    return "light" if int(value) else "dark"
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    continue
+    except Exception:
+        pass
+
+    # Registry access can be blocked by a locked-down profile.  A ctypes
+    # fallback keeps the decision explicit; a failed probe is dark, never a
+    # partially initialized palette.
+    try:
+        user32 = ctypes.windll.user32
+        get_sys_color = getattr(user32, "GetSysColor", None)
+        if get_sys_color is not None:
+            # COLOR_WINDOWTEXT is a useful low-level signal when the registry
+            # is unavailable: a very bright foreground normally means dark UI.
+            rgb = int(get_sys_color(8))
+            red, green, blue = rgb & 0xFF, (rgb >> 8) & 0xFF, (rgb >> 16) & 0xFF
+            return "dark" if (red + green + blue) > 420 else "light"
+    except Exception:
+        pass
+    return "dark"
+
+
+def _get_windows_work_areas(host) -> tuple[list[WorkArea], int]:
+    """Return monitor work areas, preferring the Win32 monitor API."""
+
+    areas: list[WorkArea] = []
+    primary_index = 0
+    if os.name == "nt":
+        try:
+            class _Rect(ctypes.Structure):
+                _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                            ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+            class _MonitorInfo(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _Rect),
+                            ("rcWork", _Rect), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_int, wintypes.HANDLE, wintypes.HDC,
+                ctypes.POINTER(_Rect), wintypes.LPARAM,
+            )
+
+            def _collect(monitor, _hdc, _rect, _data):
+                nonlocal primary_index
+                info = _MonitorInfo()
+                info.cbSize = ctypes.sizeof(_MonitorInfo)
+                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    areas.append(WorkArea(int(work.left), int(work.top), int(work.right), int(work.bottom)))
+                    if info.dwFlags & 1:
+                        primary_index = len(areas) - 1
+                return 1
+
+            callback = callback_type(_collect)
+            if user32.EnumDisplayMonitors(None, None, callback, 0) and areas:
+                return areas, primary_index
+        except Exception as exc:
+            logger.debug("Windows work-area enumeration unavailable: %s", exc)
+
+    try:
+        width = max(1, int(host.winfo_screenwidth()))
+        height = max(1, int(host.winfo_screenheight()))
+    except Exception:
+        width, height = 1024, 768
+    return [WorkArea.from_xywh(0, 0, width, height)], 0
 
 
 if getattr(sys, "frozen", False):
@@ -46,6 +192,7 @@ else:
 STATE_PATH = DATA_DIR / "document_station_entries.json"
 MODULE_STATE_PATH = DATA_DIR / "custom_modules.json"
 QUICK_ACTIONS_PATH = DATA_DIR / "quick_actions.json"
+WINDOW_GEOMETRY_PATH = DATA_DIR / "window_geometry.json"
 DEFAULT_EXPORT_BAT = Path(r"F:\F_tunk\工具_指定配置文件导出.bat")
 DEFAULT_SVN_ROOT = Path(r"F:\F_tunk")
 
@@ -56,23 +203,6 @@ MODULE_TYPE_LABELS = {
     "commit-svn": "SVN 提交",
     "open-web": "打开网页",
     "app-launch": "打开应用",
-}
-
-THEME = {
-    "bg": "#1a1b2e",
-    "surface": "#232438",
-    "elevated": "#2a2b42",
-    "hover": "#313349",
-    "card": "#262840",
-    "border": "#353755",
-    "text": "#f0f1f8",
-    "text_sec": "#b8bbd8",
-    "text_muted": "#8a8db0",
-    "primary": "#7c6ef0",
-    "primary_hover": "#8b7ff5",
-    "danger": "#e85a5a",
-    "success": "#4ade80",
-    "warning": "#fbbf24",
 }
 
 FONT = "Microsoft YaHei UI"
@@ -99,31 +229,6 @@ FS = {
     "toast": 12,
     "dialog": 12,
 }
-
-ACTION_ICON_COLORS = {
-    "folder-copy": "#60a5fa",
-    "launch-bat": "#fbbf24",
-    "update-svn": "#4ade80",
-    "commit-svn": "#f43f5e", # 经典玫瑰红/粉红，代表提交/保存状态
-    "open-web": "#a855f7",    # 科技紫，代表网络跳转
-    "app-launch": "#38bdf8",  # 天蓝色，代表打开应用
-    "copy": "#60a5fa",
-    "bat": "#fbbf24",
-    "svn": "#4ade80",
-}
-
-ACTION_ICON_TEXT = {
-    "folder-copy": "📋",
-    "launch-bat": "⚡",
-    "update-svn": "🔄",
-    "commit-svn": "📤", # SVN 提交
-    "open-web": "🌐",   # 打开网页
-    "app-launch": "🚀", # 打开应用
-    "copy": "📋",
-    "bat": "⚡",
-    "svn": "🔄",
-}
-
 
 QUICK_ACTION_DEFS = [
     {
@@ -252,6 +357,55 @@ def _ensure_win32():
 class WindowsIconCache:
     """完美抓取 Windows 真实物理文件及关联后缀的 .ico 图像资源，并高速缓存在内存中供 Tkinter 渲染。"""
     _cache = {}
+    _cache_errors = {}
+    _diagnostics = {
+        "requests": 0,
+        "successes": 0,
+        "failures": 0,
+        "fallbacks": 0,
+        "last": [],
+    }
+
+    @classmethod
+    def reset_diagnostics(cls) -> None:
+        cls._diagnostics = {
+            "requests": 0,
+            "successes": 0,
+            "failures": 0,
+            "fallbacks": 0,
+            "last": [],
+        }
+
+    @classmethod
+    def diagnostics_snapshot(cls) -> dict:
+        snapshot = dict(cls._diagnostics)
+        snapshot["last"] = [dict(item) for item in cls._diagnostics["last"]]
+        return snapshot
+
+    @classmethod
+    def _record_diagnostic(
+        cls,
+        path_or_extension: str,
+        *,
+        real_icon: bool,
+        fallback: bool,
+        error: Exception | None = None,
+    ) -> None:
+        cls._diagnostics["requests"] += 1
+        if real_icon:
+            cls._diagnostics["successes"] += 1
+        if error is not None:
+            cls._diagnostics["failures"] += 1
+        if fallback:
+            cls._diagnostics["fallbacks"] += 1
+        cls._diagnostics["last"].append({
+            "path_or_extension": path_or_extension,
+            "real_icon": real_icon,
+            "fallback": fallback,
+            "error_type": type(error).__name__ if error is not None else None,
+            "error_message": str(error) if error is not None else None,
+        })
+        del cls._diagnostics["last"][:-20]
 
     @classmethod
     def get_system_icon_image(cls, path_str: str, is_folder: bool = False) -> ImageTk.PhotoImage | None:
@@ -277,9 +431,18 @@ class WindowsIconCache:
         p = Path(path_str)
         ext = "folder" if (is_folder or p.is_dir()) else p.suffix.lower()
         if ext in cls._cache:
-            return cls._cache[ext]
+            cached = cls._cache[ext]
+            cached_error = cls._cache_errors.get(ext)
+            cls._record_diagnostic(
+                path_str or ext,
+                real_icon=isinstance(cached, ImageTk.PhotoImage),
+                fallback=not isinstance(cached, ImageTk.PhotoImage),
+                error=cached_error,
+            )
+            return cached
 
         _ensure_win32()
+        shell_error: Exception | None = None
         if win32gui and win32ui:
             try:
                 shfileinfo = SHFILEINFOW()
@@ -321,9 +484,12 @@ class WindowsIconCache:
                     
                     photo = ImageTk.PhotoImage(img)
                     cls._cache[ext] = photo
+                    cls._record_diagnostic(path_str or ext, real_icon=True, fallback=False)
                     return photo
-            except Exception:
-                pass
+            except Exception as exc:
+                shell_error = exc
+        else:
+            shell_error = RuntimeError("Windows Shell icon backend unavailable")
 
         fallback_emoji = "📁" if (is_folder or p.is_dir()) else "📄"
         if not (is_folder or p.is_dir()):
@@ -337,6 +503,8 @@ class WindowsIconCache:
             fallback_emoji = icon_map.get(ext, "📄")
             
         cls._cache[ext] = fallback_emoji
+        cls._cache_errors[ext] = shell_error or RuntimeError("Windows Shell icon lookup returned no icon")
+        cls._record_diagnostic(path_str or ext, real_icon=False, fallback=True, error=cls._cache_errors[ext])
         return fallback_emoji
 
     @classmethod
@@ -347,22 +515,67 @@ class WindowsIconCache:
 class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self) -> None:
         super().__init__()
+        self.theme_mode = parse_theme_mode(os.environ.get("AITOOL_THEME", "system"))
+        self.effective_theme = resolve_theme_mode(
+            self.theme_mode,
+            system_theme=_detect_system_effective_theme(),
+        )
+        self._tokens = theme_tokens(self.effective_theme)
+        ctk.set_appearance_mode(self.effective_theme)
         self.TkdndVersion = TkinterDnD._require(self)
-        from tkinterdnd2 import DND_FILES, DND_TEXT
-        self.drop_target_register(DND_FILES, DND_TEXT)
-        self.dnd_bind("<<Drop>>", self._on_global_drop)
+        self._geometry_save_job = None
+        self._geometry_restoring = True
         self._init_storage()
         self._init_window()
         self._build_ui()
         self._refresh_all()
+        self.after_idle(self._finish_geometry_restore)
+
+        try:
+            self.drop_target_register(DND_FILES, DND_TEXT)
+            self.dnd_bind("<<Drop>>", self._on_global_drop)
+            _record_dnd_registration("target", self, True)
+        except Exception as exc:
+            _record_dnd_registration("target", self, False, exc)
+
+    def _t(self, name: str):
+        """Resolve a visual token from the single startup palette."""
+
+        return self._tokens[name]
+
+    def _finish_geometry_restore(self) -> None:
+        self._geometry_restoring = False
 
     def _on_mousewheel(self, event):
-        # 优化滑动体验：当且仅当卡片区域的总高度（bbox("all") 的 height）大于当前 Canvas 的视口物理高度（winfo_height）时，才允许滑动滚动。
-        # 这可以完美防止在内容没有占满界面时，用户由于无意间滑轮操作导致界面整体被不自然地往上或往下卷曲，产生大片虚空露白！
-        canvas_h = self._card_canvas.winfo_height()
-        content_h = self._card_canvas.bbox("all")[3] # 获得内容底边界 Y 坐标，即总高度
-        if content_h > canvas_h:
-            self._card_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._scroll_canvas(self._actions_canvas, event)
+
+    @staticmethod
+    def _scroll_canvas(canvas, event) -> None:
+        bbox = canvas.bbox("all")
+        if not bbox:
+            return
+        canvas_height = canvas.winfo_height()
+        content_height = bbox[3] - bbox[1]
+        if content_height > canvas_height:
+            delta = int(-1 * (event.delta / 120)) or (-1 if event.delta > 0 else 1)
+            canvas.yview_scroll(delta, "units")
+
+    def _on_station_mousewheel(self, event):
+        self._scroll_canvas(self._station_canvas, event)
+
+    @staticmethod
+    def _bind_mousewheel_recursive(widget, callback) -> None:
+        """让动态条目的外层和内部控件都把滚轮交给对应滚动区。"""
+        widget.bind("<MouseWheel>", callback, add="+")
+        for child in widget.winfo_children():
+            DesktopToolApp._bind_mousewheel_recursive(child, callback)
+
+    def _configure_disabled_textbox(self, textbox) -> None:
+        """为 CTkTextbox 设置主题化 disabled 状态颜色。"""
+        textbox.configure(
+            text_color=self._t("disabled_foreground"),
+            fg_color=self._t("disabled_background"),
+        )
 
     def _init_storage(self) -> None:
         self._ensure_default_config()
@@ -404,21 +617,60 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         """生成并返回一个统一的高颜值科技感图标 (PIL.Image 格式)"""
         from PIL import Image, ImageDraw
         # 1. 采用与软件左上角、任务栏一致的高颜值科技感蓝紫色圆角双层方框
-        img = Image.new("RGB", (64, 64), (26, 27, 46)) # 与软件底色契合的优雅蓝黑色背景
+        img = Image.new("RGB", (64, 64), self._t("background"))
         draw = ImageDraw.Draw(img)
         
         # 外层方框 (深邃科技靛蓝色)
-        draw.rounded_rectangle([4, 4, 60, 60], radius=16, fill="#2a2e45", outline="#4a557a", width=2)
+        draw.rounded_rectangle([4, 4, 60, 60], radius=16,
+                               fill=self._t("elevated"), outline=self._t("border"), width=2)
         # 内层方框 (炫酷的渐变科技紫蓝色)
-        draw.rounded_rectangle([12, 12, 52, 52], radius=10, fill="#7c6ef0")
+        draw.rounded_rectangle([12, 12, 52, 52], radius=10, fill=self._t("primary"))
         return img
+
+    def _save_window_geometry_now(self) -> None:
+        if getattr(self, "_geometry_restoring", False):
+            return
+        try:
+            import re
+
+            match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self.geometry())
+            if match is None:
+                return
+            candidate = WindowGeometry(
+                int(match.group(3)), int(match.group(4)),
+                int(match.group(1)), int(match.group(2)),
+            )
+            save_window_geometry(WINDOW_GEOMETRY_PATH, candidate)
+        except Exception as exc:
+            logger.debug("window geometry save skipped: %s", exc)
+
+    def _schedule_geometry_save(self, _event=None) -> None:
+        if self._geometry_restoring:
+            return
+        if self._geometry_save_job is not None:
+            try:
+                self.after_cancel(self._geometry_save_job)
+            except Exception:
+                pass
+        self._geometry_save_job = self.after(350, self._save_window_geometry_now)
 
     def _init_window(self) -> None:
         self.title("AiTool")
-        self.geometry("360x580")
-        self.minsize(320, 420)
-        self.maxsize(480, 800)
-        self.configure(fg_color=THEME["bg"])
+        work_areas, primary_index = _get_windows_work_areas(self)
+        restored = load_and_place_window_geometry(
+            WINDOW_GEOMETRY_PATH,
+            work_areas,
+            primary_index=primary_index,
+        )
+        work_area = select_work_area(restored, work_areas, primary_index=primary_index)
+        self.minsize(
+            min(MIN_WINDOW_WIDTH, work_area.width),
+            min(MIN_WINDOW_HEIGHT, work_area.height),
+        )
+        x_geometry = f"+{restored.x}" if restored.x >= 0 else str(restored.x)
+        y_geometry = f"+{restored.y}" if restored.y >= 0 else str(restored.y)
+        self.geometry(f"{restored.width}x{restored.height}{x_geometry}{y_geometry}")
+        self.configure(fg_color=self._t("background"))
         self.attributes("-topmost", True)
         self._pinned = True
         self.overrideredirect(False)
@@ -434,6 +686,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         # 拦截关闭按钮：改为最小化到系统托盘
         self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+        self.bind("<Configure>", self._schedule_geometry_save, add="+")
         self._tray_icon = None
 
         # 1. 默认并强力开启 Windows 开机自启动，确保出厂即常驻！
@@ -550,13 +803,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             dialog.title("设置中心")
             dialog.geometry("320x260") # 微调增高高度，为全局快捷键 Alt+A 标识提供排版空间
             dialog.resizable(False, False)
-            dialog.configure(fg_color=THEME["bg"])
+            dialog.configure(fg_color=self._t("background"))
             dialog.transient(self)
             dialog.grab_set()
 
             ctk.CTkLabel(dialog, text="⚙️ AiTool 桌面工具 设置中心",
                          font=ctk.CTkFont(family=FONT, size=13, weight="bold"),
-                         text_color=THEME["primary_hover"]).pack(pady=(20, 16))
+                         text_color=self._t("focus")).pack(pady=(20, 16))
 
             # 开机自启动复选开关
             is_auto = self._get_startup_status()
@@ -570,32 +823,47 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             switch = ctk.CTkSwitch(dialog, text="开机自启动", variable=startup_var,
                                    command=_on_switch_toggle,
                                    font=ctk.CTkFont(family=FONT, size=11, weight="bold"),
-                                   progress_color=THEME["primary"], text_color=THEME["text_sec"])
+                                   progress_color=self._t("primary"), text_color=self._t("secondary"))
             switch.pack(pady=8)
 
             ctk.CTkLabel(dialog, text="开启后，电脑开机时将自动运行 AiTool",
                          font=ctk.CTkFont(family=FONT, size=9),
-                         text_color=THEME["text_muted"]).pack(pady=(0, 12))
+                         text_color=self._t("muted")).pack(pady=(0, 12))
 
             # 增加全局快捷键的可视化展示
             hotkey_lbl = ctk.CTkLabel(dialog, text="全局唤醒/隐藏快捷键：Alt + A",
                                       font=ctk.CTkFont(family=FONT, size=11, weight="bold"),
-                                      text_color=THEME["primary_hover"])
+                                      text_color=self._t("focus"))
             hotkey_lbl.pack(pady=4)
 
             ctk.CTkLabel(dialog, text="在任何界面按 Alt + A，即可快速闪现/退避隐藏窗口",
                          font=ctk.CTkFont(family=FONT, size=9),
-                         text_color=THEME["text_muted"]).pack(pady=(0, 16))
+                         text_color=self._t("muted")).pack(pady=(0, 16))
 
             ctk.CTkButton(dialog, text="关闭设置", corner_radius=6,
-                          fg_color=THEME["hover"], hover_color=THEME["elevated"],
-                          text_color=THEME["text"], font=ctk.CTkFont(family=FONT, size=11),
+                          fg_color=self._t("hover"), hover_color=self._t("elevated"),
+                          text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=11),
                           command=dialog.destroy).pack(fill="x", padx=40)
 
         self.after(0, _build_dialog)
 
+    def _quit_from_tray(self) -> None:
+        """在 Tk 主线程中完成托盘退出，避免从 pystray 线程触碰 Tk。"""
+        self._save_window_geometry_now()
+
+        tray_icon = self._tray_icon
+        self._tray_icon = None
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception as exc:
+                logger.debug("tray stop skipped during quit: %s", exc)
+
+        self.quit()
+
     def _minimize_to_tray(self) -> None:
         """隐藏窗口并在系统托盘中生成一个精美的托盘图标。"""
+        self._save_window_geometry_now()
         self.withdraw() # 隐藏主窗口
 
         # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
@@ -613,8 +881,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             def _quit_app(icon, item):
                 """彻底安全退出应用，清除托盘"""
-                icon.stop()
-                self.quit()
+                self.after(0, self._quit_from_tray)
 
             def _get_startup_menu_label(item):
                 return "✓ 开机自启动" if self._get_startup_status() else "开机自启动"
@@ -645,59 +912,17 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)  # 让唯一的 Canvas 填充整个主窗口区域实现“整页一起滚动”
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)
 
         import tkinter as tk
-        # 1. 重构整页联动滑动：
-        # - 痛点：之前的“中转站”和“功能卡片”是两个彼此割裂的 Widget Grid。中转站钉在上方，只有下方的卡片区能滑动，超出无法展现。
-        # - 重构方案：我们使用一个全域 Canvas + CTkScrollbar 作为主架构，把中转站 (Station) 和 卡片功能区 (Cards) 全部作为子卡片渲染放入同一个 `self._main_inner` 容器。
-        # - 如此一来，“中转站”和“功能卡”都会完美地在这个画布内，随着滚轮在**整个工具界面**范围内一并平滑滑动，视觉更统一、更现代、更开阔！
-        
-        from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
-        
-        self.main_scroll = ctk.CTkFrame(self, fg_color=THEME["bg"], corner_radius=0)
-        self.main_scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
-        self.main_scroll.grid_columnconfigure(0, weight=1)
-        self.main_scroll.grid_rowconfigure(0, weight=1)
+        self.content = ctk.CTkFrame(self, fg_color=self._t("background"), corner_radius=0)
+        self.content.grid(row=0, column=0, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=0)
+        self.content.grid_rowconfigure(1, weight=1)
+        self._register_dnd_target(self.content)
 
-        self._card_canvas = tk.Canvas(self.main_scroll, bg=THEME["bg"], highlightthickness=0, bd=0)
-        scrollbar = ctk.CTkScrollbar(self.main_scroll, command=self._card_canvas.yview)
-        
-        self._card_inner = ctk.CTkFrame(self._card_canvas, fg_color=THEME["bg"])
-        
-        def _update_scrollregion(event):
-            self._card_canvas.configure(scrollregion=self._card_canvas.bbox("all"))
-
-        self._card_inner.bind("<Configure>", _update_scrollregion)
-        self._card_window = self._card_canvas.create_window((0, 0), window=self._card_inner, anchor="nw")
-        self._card_canvas.configure(yscrollcommand=scrollbar.set)
-
-        self._card_canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self._card_inner.grid_columnconfigure(0, weight=1)
-        self._card_canvas.bind("<Configure>", lambda event: self._card_canvas.itemconfig(self._card_window, width=event.width))
-
-        def _on_mousewheel_local(event):
-            self._on_mousewheel(event)
-
-        self._card_canvas.bind("<MouseWheel>", _on_mousewheel_local)
-        self._card_inner.bind("<MouseWheel>", _on_mousewheel_local)
-
-        # 挂载全域拖拽事件：同时注册 DND_FILES (文件) 和 DND_TEXT (文本/字符串超链接)
-        # - 痛点：TkinterDnD 如果默认只注册 DND_FILES，那么拖入“纯文本/URL字符串”时，Windows 系统会返回禁止图标（🚫 标志）
-        # - 解决方案：我们同时向整个界面和画布注册 DND_TEXT 监听，完美打通操作系统底层的文本数据拖放通道！
-        self._card_canvas.drop_target_register(DND_FILES, DND_TEXT)
-        self._card_canvas.dnd_bind("<<Drop>>", self._on_global_drop)
-        self._card_canvas.dnd_bind("<<DragEnter>>", self._on_global_drag_enter)
-        self._card_canvas.dnd_bind("<<DragLeave>>", self._on_global_drag_leave)
-        
-        self._card_inner.drop_target_register(DND_FILES, DND_TEXT)
-        self._card_inner.dnd_bind("<<Drop>>", self._on_global_drop)
-        self._card_inner.dnd_bind("<<DragEnter>>", self._on_global_drag_enter)
-        self._card_inner.dnd_bind("<<DragLeave>>", self._on_global_drag_leave)
-
-        # 构建子区域
         self._build_station_area()
         self._build_card_area()
         self._build_statusbar()
@@ -705,54 +930,110 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.bind_all("<Control-v>", self._on_paste)
 
     def _build_station_area(self) -> None:
-        wrap = ctk.CTkFrame(self._card_inner, fg_color=THEME["surface"], corner_radius=0)
-        wrap.pack(fill="x", padx=0, pady=0)
-        wrap.grid_columnconfigure(0, weight=1)
+        import tkinter as tk
 
-        header = ctk.CTkFrame(wrap, fg_color="transparent")
+        self.station_section = ctk.CTkFrame(self.content, fg_color=self._t("surface"), corner_radius=0)
+        self.station_section.grid(row=0, column=0, sticky="nsew")
+        self.station_section.configure(height=188)
+        self.station_section.grid_propagate(False)
+        self.station_section.grid_columnconfigure(0, weight=1)
+        self.station_section.grid_rowconfigure(1, weight=1)
+
+        self._register_dnd_target(self.station_section)
+
+        header = ctk.CTkFrame(self.station_section, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=SPACING["md"], pady=(SPACING["sm"] + 2, SPACING["xs"]))
         header.grid_columnconfigure(1, weight=1)
+        self._register_dnd_target(header)
         ctk.CTkLabel(header, text="中转站", font=ctk.CTkFont(family=FONT, size=FS["section_title"], weight="bold"),
-                     text_color=THEME["text_sec"]).grid(row=0, column=0, sticky="w")
+                     text_color=self._t("secondary")).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(header, text="拖入收藏 · 拖出复制 · 双击打开",
-                     font=ctk.CTkFont(family=FONT, size=FS["status"] - 1), text_color=THEME["text_muted"]).grid(row=0, column=1, sticky="e")
+                     font=ctk.CTkFont(family=FONT, size=FS["status"] - 1), text_color=self._t("muted")).grid(row=0, column=1, sticky="e")
 
         self.btn_pin = ctk.CTkButton(header, text="📌", width=24, height=24, corner_radius=12,
-                                     fg_color=THEME["hover"], hover_color=THEME["elevated"],
+                                     fg_color=self._t("hover"), hover_color=self._t("elevated"),
                                      font=ctk.CTkFont(family=FONT, size=11),
                                      command=self._toggle_pin)
         self.btn_pin.grid(row=0, column=2, padx=(SPACING["xs"] + 2, 0))
+        self._register_dnd_recursive(header)
 
-        self.station_frame = ctk.CTkFrame(wrap, fg_color=THEME["surface"], height=110,
-                                          corner_radius=0)
-        self.station_frame.grid(row=2, column=0, sticky="ew", padx=SPACING["sm"], pady=(0, SPACING["sm"]))
-        self.station_frame.grid_propagate(False)
-        self.station_frame.grid_columnconfigure(0, weight=1)
-        self.station_frame.grid_rowconfigure(0, weight=1)
+        self.station_scroll = ctk.CTkFrame(self.station_section, fg_color=self._t("surface"), corner_radius=0)
+        self.station_scroll.grid(row=1, column=0, sticky="nsew", padx=SPACING["sm"], pady=(0, SPACING["sm"]))
+        self.station_scroll.grid_columnconfigure(0, weight=1)
+        self.station_scroll.grid_rowconfigure(0, weight=1)
+        self._register_dnd_target(self.station_scroll)
+        self._station_canvas = tk.Canvas(self.station_scroll, bg=self._t("canvas"), highlightthickness=0, bd=0)
+        self.station_scrollbar = ctk.CTkScrollbar(
+            self.station_scroll, command=self._station_canvas.yview,
+            fg_color=self._t("surface"), button_color=self._t("scrollbar"),
+            button_hover_color=self._t("pressed"),
+        )
+        self._station_canvas.grid(row=0, column=0, sticky="nsew")
+        self.station_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._station_item_host = ctk.CTkFrame(self._station_canvas, fg_color=self._t("surface"), corner_radius=0)
+        self._station_item_host.grid_columnconfigure(0, weight=1)
+        self._station_canvas_window = self._station_canvas.create_window((0, 0), window=self._station_item_host, anchor="nw")
+        self._station_canvas.configure(yscrollcommand=self.station_scrollbar.set)
+        self._station_item_host.bind("<Configure>", lambda e: self._station_canvas.configure(scrollregion=self._station_canvas.bbox("all")))
+        self._station_canvas.bind("<Configure>", lambda e: self._station_canvas.itemconfigure(self._station_canvas_window, width=e.width))
+        self._station_canvas.bind("<MouseWheel>", self._on_station_mousewheel)
+        self._station_item_host.bind("<MouseWheel>", self._on_station_mousewheel)
+        self.station_frame = self._station_item_host
 
         self.station_empty_label = ctk.CTkLabel(
-            self.station_frame, text="拖入文件或文件夹",
-            font=ctk.CTkFont(family=FONT, size=FS["station_name"]), text_color=THEME["text_muted"])
+            self._station_item_host, text="拖入文件或文件夹",
+            font=ctk.CTkFont(family=FONT, size=FS["station_name"]), text_color=self._t("muted"))
         self.station_empty_label.pack(expand=True, pady=SPACING["sm"])
 
+        self._register_dnd_target(self._station_canvas)
+        self._register_dnd_target(self._station_item_host)
+        self._register_dnd_recursive(self.station_scroll)
+
     def _build_card_area(self) -> None:
-        self.card_scroll = ctk.CTkFrame(self._card_inner, fg_color=THEME["bg"], corner_radius=0)
-        self.card_scroll.pack(fill="both", expand=True, padx=0, pady=0)
-        self.card_scroll.grid_columnconfigure(0, weight=1)
+        import tkinter as tk
+
+        self.actions_scroll = ctk.CTkFrame(self.content, fg_color=self._t("background"), corner_radius=0)
+        self.actions_scroll.grid(row=1, column=0, sticky="nsew")
+        self.actions_scroll.grid_columnconfigure(0, weight=1)
+        self.actions_scroll.grid_rowconfigure(0, weight=1)
+        self._register_dnd_target(self.actions_scroll)
+        self._actions_canvas = tk.Canvas(self.actions_scroll, bg=self._t("canvas"), highlightthickness=0, bd=0)
+        self.actions_scrollbar = ctk.CTkScrollbar(
+            self.actions_scroll, command=self._actions_canvas.yview,
+            fg_color=self._t("background"), button_color=self._t("scrollbar"),
+            button_hover_color=self._t("pressed"),
+        )
+        self._actions_canvas.grid(row=0, column=0, sticky="nsew")
+        self.actions_scrollbar.grid(row=0, column=1, sticky="ns")
+        self._action_item_host = ctk.CTkFrame(self._actions_canvas, fg_color=self._t("background"), corner_radius=0)
+        self._action_item_host.grid_columnconfigure(0, weight=1)
+        self._actions_canvas_window = self._actions_canvas.create_window((0, 0), window=self._action_item_host, anchor="nw")
+        self._actions_canvas.configure(yscrollcommand=self.actions_scrollbar.set)
+        self._action_item_host.bind("<Configure>", lambda e: self._actions_canvas.configure(scrollregion=self._actions_canvas.bbox("all")))
+        self._actions_canvas.bind("<Configure>", lambda e: self._actions_canvas.itemconfigure(self._actions_canvas_window, width=e.width))
+        self._actions_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._action_item_host.bind("<MouseWheel>", self._on_mousewheel)
+        self.card_scroll = self.actions_scroll
+
+        self._register_dnd_target(self._actions_canvas)
+        self._register_dnd_target(self._action_item_host)
+        self._register_dnd_recursive(self.actions_scroll)
 
     def _build_statusbar(self) -> None:
-        bar = ctk.CTkFrame(self, fg_color=THEME["surface"], height=30, corner_radius=0)
-        bar.grid(row=1, column=0, sticky="ew")
-        bar.grid_propagate(False)
+        self.statusbar = ctk.CTkFrame(self, fg_color=self._t("surface"), height=30, corner_radius=0)
+        self.statusbar.grid(row=1, column=0, sticky="ew")
+        self.statusbar.grid_propagate(False)
+        self._register_dnd_target(self.statusbar)
 
-        self.status_dot = ctk.CTkLabel(bar, text="●", width=20,
-                                       text_color=THEME["success"],
+        self.status_dot = ctk.CTkLabel(self.statusbar, text="●", width=20,
+                                       text_color=self._t("success"),
                                        font=ctk.CTkFont(family=FONT, size=9))
         self.status_dot.grid(row=0, column=0, padx=(SPACING["md"], SPACING["xs"]))
 
-        self.status_label = ctk.CTkLabel(bar, text="就绪", font=ctk.CTkFont(family=FONT, size=FS["status"]),
-                                         text_color=THEME["text_sec"])
+        self.status_label = ctk.CTkLabel(self.statusbar, text="就绪", font=ctk.CTkFont(family=FONT, size=FS["status"]),
+                                         text_color=self._t("secondary"))
         self.status_label.grid(row=0, column=1, sticky="w")
+        self._register_dnd_recursive(self.statusbar)
 
     # ============================================================
     # 数据刷新
@@ -765,13 +1046,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(500, self._show_user_guide)
 
     def _refresh_station(self) -> None:
-        for w in self.station_frame.winfo_children():
+        for w in tuple(self._station_item_host.winfo_children()):
             w.destroy()
 
         if not self.entries:
             self.station_empty_label = ctk.CTkLabel(
                 self.station_frame, text="拖入文件或文件夹",
-                font=ctk.CTkFont(family=FONT, size=FS["status"]), text_color=THEME["text_muted"])
+                font=ctk.CTkFont(family=FONT, size=FS["status"]), text_color=self._t("muted"))
             self.station_empty_label.pack(expand=True, pady=SPACING["sm"])
             self._register_dnd_recursive(self.station_frame)
             return
@@ -796,43 +1077,43 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         icon_img = WindowsIconCache.get_system_icon_image(entry.path, entry.kind == "folder")
         
-        icon_label = tk.Label(item, bg=THEME["surface"])
+        icon_label = tk.Label(item, bg=self._t("surface"))
         if isinstance(icon_img, ImageTk.PhotoImage):
             icon_label.configure(image=icon_img)
             icon_label.image = icon_img
         else:
-            icon_label.configure(text=str(icon_img), font=(FONT, 14), fg=THEME["text"])
+            icon_label.configure(text=str(icon_img), font=(FONT, 14), fg=self._t("text"))
             
         icon_label.grid(row=0, column=0, sticky="", pady=3)
 
         name_text = entry.display_name
         if not exists:
             name_text += " (失效)"
-        name_fg = THEME["text"] if exists else THEME["text_muted"]
+        name_fg = self._t("text") if exists else self._t("muted")
         
         name_label = tk.Label(item, text=name_text,
                               font=(FONT, FS["station_name"]),
-                              bg=THEME["surface"], fg=name_fg, anchor="w")
+                              bg=self._t("surface"), fg=name_fg, anchor="w")
         name_label.grid(row=0, column=1, sticky="ew", padx=2, pady=3)
 
         # 1. 【中转站删除闪烁与点击痛点完美解决！】
         # - 痛点：以前用 grid_forget + grid 动态显隐，会造成剧烈的闪烁位移。
         # - 解决方案：固定使用 column=2 绝对物理预留列，并且通过配置文字前景色（text_color）和卡片背景完美咬合。
-        # - 默认状态下：将前景色 text_color 设为和行背景一模一样的卡片色（THEME["surface"]），从而达到无形显隐的效果，绝不抖动闪变！
+        # - 默认状态下：将前景色 text_color 设为和行背景一模一样的卡片色（self._t("surface")），从而达到无形显隐的效果，绝不抖动闪变！
         # - 鼠标移入行时：立刻将 text_color 变为明显的红色/灰色前景色！
         btn = ctk.CTkButton(item, text="✕", width=22, height=22, corner_radius=11,
-                            fg_color="transparent", hover_color=THEME["danger"],
-                            text_color=THEME["surface"], # 改用底板背景色替代 "transparent" 关键字，彻底消除 CTk 内部 ValueError
+                            fg_color="transparent", hover_color=self._t("danger"),
+                            text_color=self._t("surface"), # 改用底板背景色替代 "transparent" 关键字，彻底消除 CTk 内部 ValueError
                             font=ctk.CTkFont(family=FONT, size=9, weight="bold"),
                             command=lambda e=entry: self._remove_entry(e))
         # 物理位置固定，拒绝抖动，符合 Tkinter 标准 grid 属性
         btn.grid(row=0, column=2, padx=(2, SPACING["xs"]), pady=2, sticky="")
 
         def on_enter(e):
-            item.configure(fg_color=THEME["hover"])
+            item.configure(fg_color=self._t("hover"))
             for w in (icon_label, name_label):
-                w.configure(bg=THEME["hover"])
-            btn.configure(text_color=THEME["text_sec"], fg_color="transparent") # hover 时醒目亮起
+                w.configure(bg=self._t("hover"))
+            btn.configure(text_color=self._t("secondary"), fg_color="transparent") # hover 时醒目亮起
             # 用不显眼的暗灰色字体在下方状态栏显示该文件的完整物理路径
             self._set_status(entry.path, "muted")
 
@@ -847,8 +1128,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if not (rx0 <= x <= rx1 and ry0 <= y <= ry1):
                 item.configure(fg_color="transparent")
                 for w in (icon_label, name_label):
-                    w.configure(bg=THEME["surface"])
-                btn.configure(text_color=THEME["surface"], fg_color="transparent") # 完美熄灭且绝不位移抖动
+                    w.configure(bg=self._t("surface"))
+                btn.configure(text_color=self._t("surface"), fg_color="transparent") # 完美熄灭且绝不位移抖动
                 # 恢复经典“就绪”状态
                 self._set_status("就绪", "ready")
 
@@ -866,57 +1147,57 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             w.bind("<Double-Button-1>", lambda e, ent=entry: self._open_entry(ent))
             w.bind("<Button-3>", lambda e, ent=entry: self._open_entry_folder(ent)) # 鼠标右键（Button-3）点击时自动打开所在文件夹并选中
 
+        self._bind_mousewheel_recursive(item, self._on_station_mousewheel)
+
         for w in (name_label, icon_label):
-            w.drag_source_register(1, DND_FILES)
-            w.dnd_bind("<<DragInitCmd>>", lambda e, ent=entry: self._on_station_drag_out(ent))
+            try:
+                w.drag_source_register(1, DND_FILES)
+                w.dnd_bind("<<DragInitCmd>>", lambda e, ent=entry: self._on_station_drag_out(ent))
+                _record_dnd_registration("source", w, True)
+            except Exception as exc:
+                _record_dnd_registration("source", w, False, exc)
 
     def _refresh_cards(self) -> None:
-        # 为了保证整页滚动流畅：
-        # - 在刷新卡片区时，不能把中转站销毁。
-        # - 我们应该只清理 _card_inner 容器中，“快捷动作模块”的子组件。
-        # - 所以我们对 _card_inner 清理时，跳过 index 0 的中转站（Station Area）面板组件，其余全部清理重装！
-        children = self._card_inner.winfo_children()
-        # 索引 0 是中转站的 wrap 面板，我们保留它
-        for w in children[1:]:
+        for w in tuple(self._action_item_host.winfo_children()):
             w.destroy()
 
-        header = ctk.CTkFrame(self._card_inner, fg_color="transparent")
+        header = ctk.CTkFrame(self._action_item_host, fg_color="transparent")
         header.pack(fill="x", padx=SPACING["md"], pady=(SPACING["sm"], SPACING["xs"]))
         header.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(header, text="快捷动作", font=ctk.CTkFont(family=FONT, size=FS["section_title"], weight="bold"),
-                     text_color=THEME["text_sec"]).grid(row=0, column=0, sticky="w")
+                     text_color=self._t("secondary")).grid(row=0, column=0, sticky="w")
 
         self.btn_add = ctk.CTkButton(header, text="➕", width=24, height=24, corner_radius=12,
-                                     fg_color=THEME["primary"], hover_color=THEME["primary_hover"],
-                                     text_color="#fff", font=ctk.CTkFont(family=FONT, size=9),
+                                     fg_color=self._t("primary"), hover_color=self._t("focus"),
+                                     text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=9),
                                      command=self._show_add_menu)
         self.btn_add.grid(row=0, column=2, padx=(SPACING["xs"], 0))
 
         cards = self._get_all_cards()
 
         if not cards:
-            ctk.CTkLabel(self._card_inner, text="暂无动作",
+            ctk.CTkLabel(self._action_item_host, text="暂无动作",
                           font=ctk.CTkFont(family=FONT, size=FS["status"]),
-                          text_color=THEME["text_muted"]).pack(pady=20)
+                          text_color=self._t("muted")).pack(pady=20)
         else:
             for card in cards:
                 self._create_card(card)
 
         # 4. 在界面最下面加一行温馨高逼格小字：“一切都可以拖进来！”
         # - 它会作为卡片容器的收尾元素，优雅居中悬浮在最下方，文字配色选用温柔的 muted 暗灰色
-        footer = ctk.CTkFrame(self._card_inner, fg_color="transparent")
+        footer = ctk.CTkFrame(self._action_item_host, fg_color="transparent")
         footer.pack(fill="x", side="bottom", pady=(24, 16))
         
         lbl_tip = ctk.CTkLabel(footer, text="✨ 一切都可以拖进来！",
                               font=ctk.CTkFont(family=FONT, size=FS["card_desc"] + 1, slant="italic"),
-                              text_color=THEME["text_muted"], cursor="hand2")
+                              text_color=self._t("muted"), cursor="hand2")
         lbl_tip.pack(anchor="center")
         lbl_tip.bind("<MouseWheel>", self._on_mousewheel)
 
         # 绑定手动点击触发“使用说明”弹窗，提供详细极客教程
         lbl_tip.bind("<Button-1>", lambda event: self._show_user_guide(manual=True))
 
-        self._register_dnd_recursive(self._card_inner)
+        self._register_dnd_recursive(self._action_item_host)
 
     def _get_all_cards(self) -> list[dict]:
         cards = []
@@ -949,8 +1230,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _create_card(self, card: dict) -> None:
         # 重构：精巧的极简无背景板悬浮卡片式设计
-        frame = ctk.CTkFrame(self._card_inner, fg_color=THEME["card"], bg_color="transparent", corner_radius=10,
-                             border_width=1, border_color=THEME["border"])
+        frame = ctk.CTkFrame(self._action_item_host, fg_color=self._t("card"), bg_color="transparent", corner_radius=10,
+                             border_width=1, border_color=self._t("border"))
         frame.pack(fill="x", padx=SPACING["sm"], pady=SPACING["xs"])
         
         frame.grid_columnconfigure(0, minsize=SPACING["icon_col"], weight=0)
@@ -959,15 +1240,16 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         frame.grid_rowconfigure(0, weight=1)
 
         import tkinter as tk
-        icon_text = ACTION_ICON_TEXT.get(card["type"], "🧩")
-        icon_color = ACTION_ICON_COLORS.get(card["type"], THEME["text_sec"])
+        icon_text = ACTION_ICON_GLYPHS.get(card["type"], "🧩")
+        action_colors = self._tokens["action_icon_by_kind"]
+        icon_color = action_colors.get(card.get("action_type", card["type"]), self._t("action_icon"))
         
         # 2 & 3. 【彻底消除突兀的背景板，并解决卡片图标垂直偏斜问题】
         # - 痛点：以前有一个突兀的深灰色 elevated 背景板，视觉被生硬地割裂了，且 Emoji 在框里无法完美上下居中。
-        # - 解决方案：我们废除生硬的 elevated 图标框！将图标背景色直接和卡片底板 `THEME["card"]` 设为 100% 相同！
+        # - 解决方案：我们废除生硬的 elevated 图标框！将图标背景色直接和卡片底板 `self._t("card")` 设为 100% 相同！
         # - 图标直接作为精美独立的气氛组件，在 `52px` 绝对对齐格中完全居中对齐，浑然一体，绝不突兀！
         icon_label = tk.Label(frame, text=icon_text,
-                               bg=THEME["card"], fg=icon_color,
+                               bg=self._t("card"), fg=icon_color,
                                font=(FONT, 18), anchor="center") # 放大动作图标字号到 18pt
         icon_label.grid(row=0, column=0, sticky="nsew", pady=SPACING["card_pady"])
 
@@ -977,12 +1259,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         title_lbl = tk.Label(body, text=card["title"],
                              font=(FONT, FS["card_title"], "bold"),
-                             bg=THEME["card"], fg=THEME["text"], anchor="w")
+                             bg=self._t("card"), fg=self._t("text"), anchor="w")
         title_lbl.grid(row=0, column=0, sticky="w")
         
         desc_lbl = tk.Label(body, text=card.get("desc", ""),
                              font=(FONT, FS["card_desc"]),
-                             bg=THEME["card"], fg=THEME["text_muted"], anchor="w")
+                             bg=self._t("card"), fg=self._t("muted"), anchor="w")
         desc_lbl.grid(row=1, column=0, sticky="w")
 
         # 2. 【编辑箭头重构：消除突兀背景，箭头放大，极度精致】
@@ -991,9 +1273,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         # - 通过将 text 改为极具指向感的经典 Windows 右方向箭头 `">"`，字号直接拉到 `16pt bold`。
         # - 将其 `hover_color` 修改为比底板稍微亮一点的高级 hover 色，只有在鼠标放上去时，才呈现出微弱、高级的圆圈气泡效果！
         edit_btn = ctk.CTkButton(frame, text=">", width=24, height=24, corner_radius=12, # 完美的 24x24 正圆形按钮
-                                 fg_color="transparent", hover_color=THEME["hover"],
-                                 bg_color=THEME["card"],
-                                 text_color=THEME["text_sec"],
+                                 fg_color="transparent", hover_color=self._t("hover"),
+                                 bg_color=self._t("card"),
+                                 text_color=self._t("secondary"),
                                  font=ctk.CTkFont(family=FONT_MONO, size=15, weight="bold"), # 采用等宽 Consolas 完美对齐
                                  command=lambda c=card: self._edit_card(c))
 
@@ -1020,21 +1302,28 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     # 全局拖放
     # ============================================================
 
-    def _register_dnd_recursive(self, widget) -> None:
-        """递归给 widget 及其所有子组件注册 DND_FILES + DND_TEXT 拖放事件。
-
-        TkinterDnD 的事件不会向父容器冒泡，只有鼠标直接悬停的 widget 才能接收 drop。
-        所以每次动态创建/销毁子 widget 后，必须重新注册才能保证全界面都能接收网址拖拽。
-        """
+    def _register_dnd_target(self, widget) -> None:
+        """显式注册一个稳定 DND 容器，并把结果写入诊断快照。"""
         try:
             widget.drop_target_register(DND_FILES, DND_TEXT)
             widget.dnd_bind("<<Drop>>", self._on_global_drop)
             widget.dnd_bind("<<DragEnter>>", self._on_global_drag_enter)
             widget.dnd_bind("<<DragLeave>>", self._on_global_drag_leave)
-        except Exception as e:
-            logger.debug("_register_dnd_recursive skip %s: %s", type(widget).__name__, e)
+            _record_dnd_registration("target", widget, True)
+        except Exception as exc:
+            _record_dnd_registration("target", widget, False, exc)
+
+    def _register_dnd_recursive(self, widget, _generation_started: bool = False) -> None:
+        """递归给 widget 及其所有子组件注册 DND_FILES + DND_TEXT 拖放事件。
+
+        TkinterDnD 的事件不会向父容器冒泡，只有鼠标直接悬停的 widget 才能接收 drop。
+        所以每次动态创建/销毁子 widget 后，必须重新注册才能保证全界面都能接收网址拖拽。
+        """
+        if not _generation_started:
+            _DND_DIAGNOSTICS["generation"] += 1
+        self._register_dnd_target(widget)
         for child in widget.winfo_children():
-            self._register_dnd_recursive(child)
+            self._register_dnd_recursive(child, _generation_started=True)
 
     def _on_global_drag_enter(self, event) -> None:
         self._set_status("拖入文件...", "warning")
@@ -1080,8 +1369,30 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._toast(f"已自动生成模块: {', '.join(names)}", "success")
 
         if result.station_paths:
-            self.entries, added_s, skipped = collect_station_entries(result.station_paths, self.entries)
-            self.station_storage.save(self.entries)
+            station_state = self.station_storage.current_state
+            sort_mode = station_state.sort_mode
+            custom_order = list(station_state.custom_order)
+            next_entries, added_s, skipped = collect_station_entries(
+                result.station_paths,
+                self.entries,
+                sort_mode=sort_mode,
+                custom_order=custom_order,
+            )
+            if sort_mode == "custom":
+                # collect_station_entries already places unlisted entries at
+                # the end. Persist their keys there too, so later refreshes
+                # retain that position (including after remove and re-add).
+                # Keep an intentionally empty order empty; an established
+                # custom order is updated to the displayed sequence so a new
+                # entry is persisted at its end.
+                if custom_order:
+                    custom_order = [normalize_path_key(entry.path) for entry in next_entries]
+            self.station_storage.save_state(
+                next_entries,
+                sort_mode=sort_mode,
+                custom_order=custom_order,
+            )
+            self.entries = next_entries
             self._refresh_station()
             if added_s:
                 self._toast(f"已收藏到中转站: {', '.join(added_s)}", "success")
@@ -1139,8 +1450,18 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._set_status(f"已打开: {p.name}", "ready")
 
     def _remove_entry(self, entry: StationEntry) -> None:
-        self.entries = [e for e in self.entries if e.path != entry.path]
-        self.station_storage.save(self.entries)
+        station_state = self.station_storage.current_state
+        next_entries, custom_order = remove_station_entry(
+            self.entries,
+            entry.path,
+            station_state.custom_order,
+        )
+        self.station_storage.save_state(
+            next_entries,
+            sort_mode=station_state.sort_mode,
+            custom_order=custom_order,
+        )
+        self.entries = next_entries
         self._refresh_station()
         self._toast("已移除", "success")
 
@@ -1175,25 +1496,25 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             hud.title("正在同步复制")
             hud.geometry("320x150")
             hud.resizable(False, False)
-            hud.configure(fg_color=THEME["bg"])
+            hud.configure(fg_color=self._t("background"))
             hud.transient(self)
             hud.grab_set()
 
             # 居中子标签
             ctk.CTkLabel(hud, text="📂 正在同步覆盖目标文件...",
                          font=ctk.CTkFont(family=FONT, size=12, weight="bold"),
-                         text_color=THEME["text"]).pack(pady=(16, 8))
+                         text_color=self._t("text")).pack(pady=(16, 8))
 
             # 循环进度条
             progress = ctk.CTkProgressBar(hud, width=260, height=8,
-                                          fg_color=THEME["surface"], progress_color=THEME["primary"])
+                                          fg_color=self._t("surface"), progress_color=self._t("primary"))
             progress.pack(pady=8)
             progress.configure(mode="indetermined")
             progress.start()
 
             status_lbl = ctk.CTkLabel(hud, text="准备执行 I/O 通道同步...",
                                       font=ctk.CTkFont(family=FONT, size=11),
-                                      text_color=THEME["text_muted"])
+                                      text_color=self._t("muted"))
             status_lbl.pack(pady=(4, 16))
 
             def _run_with_hud():
@@ -1319,7 +1640,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 lbl_text += f" ({f['desc']})"
                 
             ctk.CTkLabel(container, text=lbl_text, font=ctk.CTkFont(family=FONT, size=12),
-                         text_color=THEME["text_sec"]).pack(anchor="w", pady=(8, 4))
+                         text_color=self._t("secondary")).pack(anchor="w", pady=(8, 4))
             
             var = ctk.StringVar(value=initial_params.get(f["key"], ""))
             param_vars[f["key"]] = var
@@ -1328,8 +1649,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             row.pack(fill="x", pady=(0, 8))
             row.grid_columnconfigure(0, weight=1)
             
-            entry = ctk.CTkEntry(row, textvariable=var, fg_color=THEME["surface"],
-                                 text_color=THEME["text"], border_color=THEME["border"],
+            entry = ctk.CTkEntry(row, textvariable=var, fg_color=self._t("surface"),
+                                 text_color=self._t("text"), border_color=self._t("border"),
                                  font=ctk.CTkFont(family=FONT, size=12))
             entry.grid(row=0, column=0, sticky="ew")
 
@@ -1347,8 +1668,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         param_vars[k].set(p)
 
                 ctk.CTkButton(row, text="选择", width=50, corner_radius=6,
-                              fg_color=THEME["hover"], hover_color=THEME["elevated"],
-                              text_color=THEME["text"], font=ctk.CTkFont(family=FONT, size=11),
+                              fg_color=self._t("hover"), hover_color=self._t("elevated"),
+                              text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=11),
                               command=_browse).grid(row=0, column=1, padx=(4, 0))
 
         return param_vars
@@ -1371,15 +1692,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog = ctk.CTkToplevel(self)
         dialog.title("编辑快捷动作")
         dialog.geometry("360x480")
-        dialog.configure(fg_color=THEME["bg"])
+        dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
-                     text_color=THEME["text_sec"]).pack(anchor="w", padx=16, pady=(16, 4))
+                     text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
         name_var = ctk.StringVar(value=qa["title"])
-        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=THEME["surface"],
-                     text_color=THEME["text"], border_color=THEME["border"],
+        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=self._t("surface"),
+                     text_color=self._t("text"), border_color=self._t("border"),
                      font=ctk.CTkFont(family=FONT, size=12)).pack(fill="x", padx=16)
 
         fields_container = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -1388,13 +1709,14 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         param_vars = self._render_config_fields(fields_container, qa.get("module_type", qa["type"]), qa.get("params", {}))
 
         ctk.CTkLabel(dialog, text="校验结果", font=ctk.CTkFont(family=FONT, size=12),
-                     text_color=THEME["text_sec"]).pack(anchor="w", padx=16, pady=(12, 4))
-        review_text = ctk.CTkTextbox(dialog, height=80, fg_color=THEME["surface"],
-                                     text_color=THEME["text_sec"], border_width=1,
-                                     border_color=THEME["border"], corner_radius=6,
+                     text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(12, 4))
+        review_text = ctk.CTkTextbox(dialog, height=80, fg_color=self._t("surface"),
+                                     text_color=self._t("secondary"), border_width=1,
+                                     border_color=self._t("border"), corner_radius=6,
                                      font=ctk.CTkFont(family=FONT, size=11))
         review_text.pack(fill="x", padx=16)
         review_text.insert("1.0", "点击「校验」检查参数")
+        self._configure_disabled_textbox(review_text)
         review_text.configure(state="disabled")
 
         def _do_review():
@@ -1441,20 +1763,20 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         btns.grid_columnconfigure(2, weight=1)
         btns.grid_columnconfigure(3, weight=1)
         ctk.CTkButton(btns, text="删除", corner_radius=6,
-                      fg_color=THEME["danger"], hover_color="#f06868",
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("danger"), hover_color=self._t("danger"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_do_delete).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ctk.CTkButton(btns, text="校验", corner_radius=6,
-                      fg_color=THEME["hover"], hover_color=THEME["elevated"],
-                      text_color=THEME["text"], font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("hover"), hover_color=self._t("elevated"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_do_review).grid(row=0, column=1, sticky="ew", padx=4)
         ctk.CTkButton(btns, text="保存", corner_radius=6,
-                      fg_color=THEME["primary"], hover_color=THEME["primary_hover"],
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("primary"), hover_color=self._t("focus"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_do_save).grid(row=0, column=2, sticky="ew", padx=4)
         ctk.CTkButton(btns, text="执行", corner_radius=6,
-                      fg_color=THEME["elevated"], hover_color=THEME["hover"],
-                      text_color=THEME["text"], font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("elevated"), hover_color=self._t("hover"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_do_execute).grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
     def _edit_module(self, card: dict) -> None:
@@ -1465,15 +1787,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog = ctk.CTkToplevel(self)
         dialog.title("编辑模块")
         dialog.geometry("360x520") # 统一高度，避免 4 行配置溢出窗口边界
-        dialog.configure(fg_color=THEME["bg"])
+        dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
-                     text_color=THEME["text_sec"]).pack(anchor="w", padx=16, pady=(16, 4))
+                     text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
         name_var = ctk.StringVar(value=module.name)
-        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=THEME["surface"],
-                     text_color=THEME["text"], border_color=THEME["border"],
+        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=self._t("surface"),
+                     text_color=self._t("text"), border_color=self._t("border"),
                      font=ctk.CTkFont(family=FONT, size=12)).pack(fill="x", padx=16)
 
         fields_container = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -1502,12 +1824,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         btns.pack(fill="x", padx=16, pady=12)
         btns.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(btns, text="删除", corner_radius=6,
-                      fg_color=THEME["danger"], hover_color="#f06868",
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("danger"), hover_color=self._t("danger"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_delete).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ctk.CTkButton(btns, text="保存", corner_radius=6,
-                      fg_color=THEME["primary"], hover_color=THEME["primary_hover"],
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("primary"), hover_color=self._t("focus"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_save).grid(row=0, column=1, sticky="ew")
 
     # ============================================================
@@ -1521,22 +1843,22 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog = ctk.CTkToplevel(self)
         dialog.title("添加模块")
         dialog.geometry("360x520") # 微增高窗体，确保新增提示行后不会出现溢出或被按钮遮挡
-        dialog.configure(fg_color=THEME["bg"])
+        dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
-                     text_color=THEME["text_sec"]).pack(anchor="w", padx=16, pady=(16, 4))
+                     text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
         name_var = ctk.StringVar()
-        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=THEME["surface"],
-                     text_color=THEME["text"], border_color=THEME["border"],
+        ctk.CTkEntry(dialog, textvariable=name_var, fg_color=self._t("surface"),
+                     text_color=self._t("text"), border_color=self._t("border"),
                      font=ctk.CTkFont(family=FONT, size=12)).pack(fill="x", padx=16)
 
         ctk.CTkLabel(dialog, text="类型", font=ctk.CTkFont(family=FONT, size=12),
-                     text_color=THEME["text_sec"]).pack(anchor="w", padx=16, pady=(12, 4))
+                     text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(12, 4))
         type_var = ctk.CTkOptionMenu(dialog, values=list(MODULE_TYPE_LABELS.values()),
-                                     fg_color=THEME["surface"], button_color=THEME["hover"],
-                                     text_color=THEME["text"],
+                                     fg_color=self._t("surface"), button_color=self._t("hover"),
+                                     text_color=self._t("text"),
                                      font=ctk.CTkFont(family=FONT, size=12))
         type_var.set(MODULE_TYPE_LABELS["folder-copy"])
         type_var.pack(fill="x", padx=16)
@@ -1592,8 +1914,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             dialog.destroy()
 
         ctk.CTkButton(dialog, text="保存", corner_radius=6,
-                      fg_color=THEME["primary"], hover_color=THEME["primary_hover"],
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("primary"), hover_color=self._t("focus"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=_save).pack(fill="x", padx=16, pady=12)
 
     # ============================================================
@@ -1619,22 +1941,22 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _set_status(self, text: str, level: str = "ready") -> None:
         self.status_label.configure(text=text)
-        colors = {"ready": THEME["success"], "warning": THEME["warning"],
-                  "blocked": THEME["danger"], "muted": THEME["text_muted"]}
-        self.status_dot.configure(text_color=colors.get(level, THEME["success"]))
+        colors = {"ready": self._t("success"), "warning": self._t("warning"),
+                  "blocked": self._t("danger"), "muted": self._t("muted")}
+        self.status_dot.configure(text_color=colors.get(level, self._t("success")))
 
     _toast_label = None
 
     def _toast(self, message: str, level: str = "") -> None:
-        colors = {"success": THEME["success"], "warning": THEME["warning"],
-                  "danger": THEME["danger"]}
-        color = colors.get(level, THEME["text_sec"])
+        colors = {"success": self._t("success"), "warning": self._t("warning"),
+                  "danger": self._t("danger")}
+        color = colors.get(level, self._t("secondary"))
 
         if DesktopToolApp._toast_label:
             DesktopToolApp._toast_label.destroy()
 
         toast = ctk.CTkLabel(self, text=message, font=ctk.CTkFont(family=FONT, size=12),
-                             text_color=color, fg_color=THEME["elevated"],
+                             text_color=color, fg_color=self._t("elevated"),
                              corner_radius=20, padx=16, pady=6)
         toast.place(relx=0.5, rely=0.08, anchor="n")
         DesktopToolApp._toast_label = toast
@@ -1663,17 +1985,17 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         guide.title("AiTool 使用说明")
         guide.geometry("380x480")
         guide.resizable(False, False)
-        guide.configure(fg_color=THEME["bg"])
+        guide.configure(fg_color=self._t("background"))
         guide.transient(self)
         guide.grab_set()
 
         ctk.CTkLabel(guide, text="✨ 欢迎使用 AiTool 生产力助手 ✨",
                      font=ctk.CTkFont(family=FONT, size=13, weight="bold"),
-                     text_color=THEME["primary_hover"]).pack(pady=(20, 12))
+                     text_color=self._t("focus")).pack(pady=(20, 12))
 
-        textbox = ctk.CTkTextbox(guide, width=340, height=340, fg_color=THEME["surface"],
-                                  text_color=THEME["text_sec"], border_width=1,
-                                  border_color=THEME["border"], corner_radius=10,
+        textbox = ctk.CTkTextbox(guide, width=340, height=340, fg_color=self._t("surface"),
+                                  text_color=self._t("secondary"), border_width=1,
+                                  border_color=self._t("border"), corner_radius=10,
                                   font=ctk.CTkFont(family=FONT, size=11, weight="bold"))
         textbox.pack(padx=20, pady=4)
 
@@ -1704,18 +2026,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         
         textbox.insert("1.0", instructions)
+        self._configure_disabled_textbox(textbox)
         textbox.configure(state="disabled")
 
         ctk.CTkButton(guide, text="我知道了", corner_radius=6,
-                      fg_color=THEME["primary"], hover_color=THEME["primary_hover"],
-                      text_color="#fff", font=ctk.CTkFont(family=FONT, size=12),
+                      fg_color=self._t("primary"), hover_color=self._t("focus"),
+                      text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=12),
                       command=guide.destroy).pack(fill="x", padx=20, pady=(12, 16))
 
-        self.after(2400, lambda: toast.destroy() if toast.winfo_exists() else None)
-
-
 def main() -> int:
-    ctk.set_appearance_mode("dark")
     app = DesktopToolApp()
     app.mainloop()
     return 0

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import ActionReview, StationEntry
+from .station_ordering import normalize_path_key, order_station_entries
 
 
 BAT_EXTENSIONS = {".bat", ".cmd"}
@@ -13,7 +14,7 @@ BAT_LAUNCH_TIMEOUT = 120
 
 
 def _normalize_path_key(path: Path) -> str:
-    return str(path.resolve()).casefold()
+    return normalize_path_key(path)
 
 
 def _safe_resolve(path: Path) -> Path:
@@ -31,6 +32,8 @@ def _is_relative_to(child: Path, parent: Path) -> bool:
 def collect_station_entries(
     raw_paths: Iterable[str],
     existing: list[StationEntry],
+    sort_mode: str = "default",
+    custom_order: Iterable[object] | None = None,
 ) -> tuple[list[StationEntry], list[str], list[str]]:
     entries = list(existing)
     known = {_normalize_path_key(Path(item.path)): item for item in entries}
@@ -53,7 +56,7 @@ def collect_station_entries(
         known[key] = entry
         added.append(entry.display_name)
 
-    entries.sort(key=lambda item: (item.kind != "folder", item.display_name.casefold()))
+    entries = order_station_entries(entries, sort_mode, custom_order)
     return entries, added, skipped
 
 

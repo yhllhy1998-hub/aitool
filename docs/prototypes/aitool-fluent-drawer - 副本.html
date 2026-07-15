@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AiTool · Fluent Drawer Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --desktop: #e9edf1;
+      --desktop-ink: #7b8792;
+      --desktop-block: #dfe5ea;
+      --desktop-block-dark: #d4dce2;
+      --window: #f7f8fa;
+      --window-solid: #f7f8fa;
+      --surface: #ffffff;
+      --surface-subtle: #f1f4f6;
+      --surface-hover: #edf3f8;
+      --surface-selected: #e4eff8;
+      --surface-disabled: #f4f5f6;
+      --line: #d9e0e6;
+      --line-strong: #c8d1d9;
+      --ink: #202932;
+      --ink-secondary: #53616d;
+      --ink-muted: #74818c;
+      --ink-faint: #89949d;
+      --accent: #476f8f;
+      --accent-strong: #315d7f;
+      --accent-soft: #e5eff6;
+      --success: #34735b;
+      --warning: #956d27;
+      --danger: #a65353;
+      --shadow: 0 20px 48px rgba(45, 56, 67, .17), 0 3px 10px rgba(45, 56, 67, .08);
+      --window-radius: 8px;
+      --control-radius: 4px;
+      --font-ui: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+      --font-mono: Consolas, "Cascadia Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--desktop);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button { font: inherit; }
+
+    .icon {
+      display: block;
+      width: 16px;
+      height: 16px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .icon-fill { fill: currentColor; stroke: none; }
+
+    .desktop-shell {
+      position: relative;
+      min-height: 100vh;
+      overflow: hidden;
+      padding: 76px 24px 36px;
+      background: var(--desktop);
+    }
+
+    /* Quiet, low-contrast shapes make the page read as a desktop rather than a web hero. */
+    .desktop-shape { position: absolute; pointer-events: none; }
+    .desktop-shape.one {
+      top: 0; left: 0; width: 31vw; height: 52vh;
+      background: var(--desktop-block);
+      clip-path: polygon(0 0, 100% 0, 70% 100%, 0 83%);
+    }
+    .desktop-shape.two {
+      right: -5vw; bottom: 11vh; width: 33vw; height: 41vh;
+      background: var(--desktop-block-dark);
+      clip-path: polygon(28% 0, 100% 12%, 100% 100%, 0 100%);
+    }
+    .desktop-shape.three {
+      left: 6vw; bottom: 15vh; width: 154px; height: 116px;
+      border: 1px solid rgba(103, 119, 132, .13);
+      background: rgba(255, 255, 255, .16);
+    }
+
+    .prototype-bar {
+      position: absolute;
+      z-index: 5;
+      top: 18px;
+      left: 24px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      color: var(--desktop-ink);
+      font-size: 12px;
+    }
+
+    .prototype-label {
+      margin-right: 5px;
+      color: #56636e;
+      letter-spacing: .02em;
+    }
+
+    .control-group {
+      display: flex;
+      padding: 2px;
+      border: 1px solid rgba(106, 120, 131, .25);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .42);
+    }
+
+    .prototype-bar button {
+      min-width: 54px;
+      height: 26px;
+      padding: 0 9px;
+      border: 0;
+      border-radius: 4px;
+      color: #66737e;
+      background: transparent;
+      cursor: pointer;
+    }
+
+    .prototype-bar button:hover,
+    .prototype-bar button.is-active {
+      color: var(--accent-strong);
+      background: #fff;
+      box-shadow: 0 1px 3px rgba(45, 56, 67, .09);
+    }
+
+    .app-window {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-rows: 44px 230px minmax(0, 1fr) 34px;
+      width: min(760px, 100%);
+      height: min(760px, calc(100vh - 108px));
+      min-height: 620px;
+      margin-left: auto;
+      margin-right: clamp(0px, 7vw, 104px);
+      overflow: hidden;
+      border: 1px solid rgba(119, 131, 142, .42);
+      border-radius: var(--window-radius);
+      background: var(--window-solid);
+      box-shadow: var(--shadow);
+    }
+
+    .titlebar {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      padding-left: 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+      user-select: none;
+    }
+
+    .app-mark {
+      display: grid;
+      width: 20px;
+      height: 20px;
+      place-items: center;
+      margin-right: 9px;
+      border: 1px solid #7997ad;
+      border-radius: 4px;
+      color: #365d79;
+      background: #eff5f9;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: -.08em;
+    }
+
+    .window-title {
+      overflow: hidden;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .window-context {
+      margin-left: 10px;
+      color: var(--ink-muted);
+      font-size: 12px;
+    }
+
+    .window-controls {
+      display: flex;
+      align-self: stretch;
+      margin-left: auto;
+    }
+
+    .window-control {
+      display: grid;
+      width: 44px;
+      height: 100%;
+      place-items: center;
+      border: 0;
+      color: var(--ink-secondary);
+      background: transparent;
+      cursor: pointer;
+    }
+
+    .window-control .icon { width: 13px; height: 13px; stroke-width: 1.5; }
+    .window-control:hover { background: var(--surface-hover); }
+    .window-control.close:hover { color: #fff; background: #c94848; }
+
+    .station {
+      min-height: 0;
+      padding: 16px 20px 13px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-subtle);
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: flex-start;
+      min-height: 36px;
+    }
+
+    .heading-copy { min-width: 0; }
+    .heading-line { display: flex; align-items: center; gap: 8px; }
+    .section-title { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .01em; }
+    .count-badge {
+      display: inline-flex;
+      min-width: 21px;
+      height: 19px;
+      align-items: center;
+      justify-content: center;
+      padding: 0 6px;
+      border-radius: 10px;
+      color: var(--accent-strong);
+      background: var(--accent-soft);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .section-description { margin: 3px 0 0; color: var(--ink-muted); font-size: 12px; }
+
+    .station-actions { display: flex; gap: 4px; margin-left: auto; }
+    .quiet-button,
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid transparent;
+      border-radius: var(--control-radius);
+      color: var(--ink-secondary);
+      background: transparent;
+      cursor: pointer;
+    }
+    .quiet-button { height: 28px; padding: 0 9px; gap: 6px; font-size: 12px; }
+    .quiet-button:hover, .icon-button:hover { border-color: var(--line-strong); background: var(--surface); }
+    .icon-button { width: 28px; height: 28px; }
+    .icon-button .icon { width: 15px; height: 15px; }
+
+    .station-list {
+      height: 114px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+    }
+
+    .station-row {
+      display: grid;
+      grid-template-columns: 38px minmax(0, 1fr) 122px 72px;
+      align-items: center;
+      min-height: 38px;
+      padding: 0 10px 0 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: default;
+    }
+    .station-row:last-child { border-bottom: 0; }
+    .station-row:hover { background: var(--surface-hover); }
+    .station-row.is-selected { background: var(--surface-selected); }
+    .file-icon { color: var(--accent); }
+    .file-icon .icon { width: 18px; height: 18px; }
+    .file-name { overflow: hidden; font-size: 13px; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; }
+    .file-path { overflow: hidden; margin-top: 2px; color: var(--ink-muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }
+    .file-detail { color: var(--ink-secondary); font-size: 11px; line-height: 1.45; }
+    .file-detail span { display: block; color: var(--ink-muted); }
+    .row-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: .48; }
+    .station-row:hover .row-actions, .station-row.is-selected .row-actions { opacity: 1; }
+    .row-actions .icon-button { width: 26px; height: 26px; }
+
+    .station-drop {
+      display: grid;
+      grid-template-columns: 38px 1fr auto;
+      align-items: center;
+      min-height: 42px;
+      padding: 0 10px 0 12px;
+      border: 1px dashed #9db4c4;
+      border-top: 0;
+      border-radius: 0 0 6px 6px;
+      color: var(--ink-secondary);
+      background: #fbfcfd;
+    }
+    .station-drop .icon { color: var(--accent); width: 18px; height: 18px; }
+    .drop-title { font-size: 12px; font-weight: 600; }
+    .drop-subtitle { margin-left: 8px; color: var(--ink-muted); font-size: 11px; }
+    .drop-key { color: var(--ink-faint); font-family: var(--font-mono); font-size: 10px; }
+
+    .actions-panel {
+      display: grid;
+      grid-template-rows: 53px minmax(0, 1fr);
+      min-height: 0;
+      padding: 0 20px;
+      background: var(--window);
+    }
+
+    .actions-heading {
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+    }
+    .actions-heading .section-title { font-size: 14px; }
+    .actions-heading .section-description { margin: 0 0 0 10px; }
+    .actions-tools { display: flex; align-items: center; gap: 7px; margin-left: auto; }
+    .filter-button { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink-secondary); background: var(--surface); font-size: 12px; }
+    .filter-button .icon { width: 13px; height: 13px; }
+    .filter-button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+    .add-button { color: var(--accent-strong); }
+
+    .action-scroll {
+      min-height: 0;
+      padding: 10px 0 14px;
+      overflow-y: auto;
+      scrollbar-color: #bdc8d0 transparent;
+      scrollbar-width: thin;
+    }
+    .action-scroll::-webkit-scrollbar { width: 8px; }
+    .action-scroll::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: #bdc8d0; background-clip: padding-box; }
+
+    .action-row {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) 126px 84px;
+      align-items: center;
+      min-height: 67px;
+      margin-bottom: 6px;
+      padding: 0 10px 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      transition: background .16s ease, border-color .16s ease, transform .16s ease;
+    }
+    .action-row:hover, .action-row.is-hover {
+      border-color: #b5c9d8;
+      background: var(--surface-hover);
+    }
+    .action-row.is-selected { border-color: #a4bfd3; background: var(--surface-selected); }
+    .action-row.is-disabled { color: var(--ink-faint); background: var(--surface-disabled); }
+    .action-row.is-disabled .action-icon, .action-row.is-disabled .action-description { color: var(--ink-faint); }
+    .action-icon { color: var(--accent); }
+    .action-icon .icon { width: 19px; height: 19px; }
+    .action-title { font-size: 13px; font-weight: 600; }
+    .action-description { overflow: hidden; margin-top: 3px; color: var(--ink-muted); font-size: 12px; white-space: nowrap; text-overflow: ellipsis; }
+    .action-meta { color: var(--ink-secondary); font-size: 11px; line-height: 1.5; }
+    .action-meta span { display: block; color: var(--ink-muted); }
+    .action-meta kbd { padding: 2px 5px; border: 1px solid var(--line); border-radius: 3px; color: var(--ink-secondary); background: var(--surface-subtle); font-family: var(--font-mono); font-size: 10px; }
+    .action-row.is-disabled .action-meta kbd { color: var(--ink-faint); background: transparent; }
+    .action-controls { display: flex; justify-content: flex-end; align-items: center; gap: 4px; }
+    .execute-button { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 9px; border: 1px solid #b6c9d8; border-radius: 4px; color: var(--accent-strong); background: #f7fbfd; cursor: pointer; font-size: 12px; }
+    .execute-button .icon { width: 13px; height: 13px; }
+    .execute-button:hover { border-color: var(--accent); background: #edf5f9; }
+    .execute-button:disabled { border-color: var(--line); color: var(--ink-faint); background: transparent; cursor: default; }
+    .more-button { width: 28px; height: 28px; }
+
+    .info-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      margin: 4px 0 0;
+      padding: 0 10px;
+      border: 1px solid #c7d9e5;
+      border-radius: 4px;
+      color: #45677e;
+      background: #f0f6fa;
+      font-size: 12px;
+    }
+    .info-bar .icon { width: 14px; height: 14px; color: var(--accent); }
+    .info-time { margin-left: auto; color: var(--ink-faint); font-family: var(--font-mono); font-size: 10px; }
+
+    .statusbar {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      padding: 0 20px;
+      border-top: 1px solid var(--line);
+      color: var(--ink-secondary);
+      background: var(--surface-subtle);
+      font-size: 11px;
+    }
+    .status-dot { width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--success); }
+    .status-detail { overflow: hidden; margin-left: 10px; color: var(--ink-muted); white-space: nowrap; text-overflow: ellipsis; }
+    .status-version { margin-left: auto; color: var(--ink-faint); font-family: var(--font-mono); }
+
+    .design-note {
+      position: absolute;
+      bottom: 28px;
+      left: 30px;
+      z-index: 1;
+      max-width: 270px;
+      color: #73808a;
+      font-size: 11px;
+      line-height: 1.65;
+    }
+    .design-note strong { display: block; margin-bottom: 3px; color: #596771; font-weight: 600; }
+    .design-note code { font-family: var(--font-mono); font-size: 10px; }
+
+    .theme-dark {
+      color-scheme: dark;
+      --desktop: #242a30;
+      --desktop-ink: #a6b2bc;
+      --desktop-block: #2d353d;
+      --desktop-block-dark: #303941;
+      --window: #1f252a;
+      --window-solid: #1f252a;
+      --surface: #252c32;
+      --surface-subtle: #20272c;
+      --surface-hover: #2b353c;
+      --surface-selected: #293e4c;
+      --surface-disabled: #23282d;
+      --line: #39434b;
+      --line-strong: #4d5c67;
+      --ink: #e8edf0;
+      --ink-secondary: #b6c2ca;
+      --ink-muted: #96a4ae;
+      --ink-faint: #75838d;
+      --accent: #8fb4cc;
+      --accent-strong: #a9cce1;
+      --accent-soft: #304957;
+      --success: #76c29e;
+      --shadow: 0 20px 48px rgba(0, 0, 0, .35), 0 3px 10px rgba(0, 0, 0, .24);
+    }
+    .theme-dark .prototype-label { color: #b4c0c8; }
+    .theme-dark .control-group { background: rgba(20, 24, 27, .25); border-color: rgba(200, 215, 224, .18); }
+    .theme-dark .prototype-bar button { color: #b4c0c8; }
+    .theme-dark .prototype-bar button:hover, .theme-dark .prototype-bar button.is-active { color: #e6f2f8; background: #3c4850; }
+    .theme-dark .app-mark { color: #b7d3e3; background: #2e424f; border-color: #69899c; }
+    .theme-dark .station-drop { background: #232a2f; border-color: #648396; }
+    .theme-dark .info-bar { color: #b8d3e2; background: #263741; border-color: #4b6a7c; }
+    .theme-dark .execute-button { color: #b8d9ec; background: #26343d; border-color: #607d8e; }
+    .theme-dark .execute-button:hover { background: #304651; }
+
+    .is-compact .app-window { grid-template-rows: 44px 200px minmax(0, 1fr) 34px; }
+    .is-compact .station { padding-top: 12px; }
+    .is-compact .station-list { height: 133px; }
+    .is-compact .station-row { min-height: 43px; }
+    .is-compact .station-drop { min-height: 40px; }
+    .is-compact .action-row { min-height: 58px; }
+    .is-compact .action-description { margin-top: 1px; }
+    .is-compact .info-bar { display: none; }
+
+    @media (max-width: 800px) {
+      .desktop-shell { padding: 70px 14px 28px; overflow: auto; }
+      .app-window { width: 100%; margin: 0; }
+      .design-note { position: relative; left: auto; bottom: auto; max-width: none; margin: 18px 4px 0; }
+      .desktop-shape.one { width: 65vw; }
+      .desktop-shape.two { width: 60vw; }
+    }
+
+    @media (max-width: 620px) {
+      .prototype-bar { left: 14px; right: 14px; gap: 5px; }
+      .prototype-label { display: none; }
+      .app-window { min-height: 650px; }
+      .station, .actions-panel { padding-left: 12px; padding-right: 12px; }
+      .station-row { grid-template-columns: 32px minmax(0, 1fr) 60px 28px; padding-left: 8px; padding-right: 6px; }
+      .station-row .file-detail { display: none; }
+      .row-actions .icon-button:first-child { display: none; }
+      .station-drop { grid-template-columns: 32px 1fr; padding-left: 8px; }
+      .drop-subtitle, .drop-key { display: none; }
+      .action-row { grid-template-columns: 34px minmax(0, 1fr) 68px 28px; padding-left: 8px; padding-right: 6px; }
+      .action-meta { display: none; }
+      .execute-button { width: 28px; padding: 0; justify-content: center; }
+      .execute-button span { display: none; }
+      .more-button { width: 26px; }
+      .actions-heading .section-description { display: none; }
+      .window-context { display: none; }
+    }
+
+    @media (max-height: 700px) and (min-width: 621px) {
+      .desktop-shell { padding-top: 64px; }
+      .app-window { height: calc(100vh - 88px); min-height: 560px; }
+      .design-note { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <svg aria-hidden="true" width="0" height="0" style="position:absolute">
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="m8 4 8 8M9.5 5.5l-4 4 4 4-2.5 5.5M14.5 5.5l4 4-4 4 2.5 5.5M12 14v7"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-maximize" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5h6l2 2h9v8.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7zM3.5 7.5V5.7A1.7 1.7 0 0 1 5.2 4h4l2 2h3"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3.8h8l4 4v12.4H6zM14 3.8v4h4M9 12h6M9 15.5h6"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.8 12h16.4M12 3.5c2.2 2.3 3.2 5.1 3.2 8.5s-1 6.2-3.2 8.5c-2.2-2.3-3.2-5.1-3.2-8.5s1-6.2 3.2-8.5z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="1.5"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-10A1.5 1.5 0 0 0 3 5.5v10A1.5 1.5 0 0 0 4.5 17H8"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><path d="m7 9 3 3-3 3M12.5 15H17"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 24 24"><path d="M19 8a7.5 7.5 0 0 0-13.4-1.8L4 8.5M4 5v3.5h3.5M5 16a7.5 7.5 0 0 0 13.4 1.8l1.6-2.3M20 19v-3.5h-3.5"/></symbol>
+    <symbol id="i-browser" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><path d="M3.5 8.5h17M7 6.5h.1M10 6.5h.1M13 6.5h.1"/></symbol>
+    <symbol id="i-explorer" viewBox="0 0 24 24"><path d="M4 6.5h6l1.7 2H20v9.8a1.7 1.7 0 0 1-1.7 1.7H5.7A1.7 1.7 0 0 1 4 18.3z"/><path d="M4 10h16"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"/><path d="m19 13.3 1.2 1-.9 1.6-1.5-.5a7.4 7.4 0 0 1-1.8 1l-.3 1.6h-1.9l-.4-1.6a7.6 7.6 0 0 1-1.8-1l-1.5.5-.9-1.6 1.2-1a7 7 0 0 1 0-2.1l-1.2-1 .9-1.6 1.5.5a7.6 7.6 0 0 1 1.8-1l.4-1.6h1.9l.3 1.6a7.4 7.4 0 0 1 1.8 1l1.5-.5.9 1.6-1.2 1a7 7 0 0 1 0 2.1z"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m9 6 8 6-8 6z"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" class="icon-fill"/><circle cx="12" cy="12" r="1" class="icon-fill"/><circle cx="19" cy="12" r="1" class="icon-fill"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4.2 4.2L19 6.5"/></symbol>
+  </svg>
+
+  <main class="desktop-shell" id="prototype">
+    <div class="desktop-shape one"></div>
+    <div class="desktop-shape two"></div>
+    <div class="desktop-shape three"></div>
+
+    <nav class="prototype-bar" aria-label="原型控制">
+      <span class="prototype-label">原型查看</span>
+      <div class="control-group" aria-label="主题">
+        <button type="button" data-theme="light" class="is-active">浅色</button>
+        <button type="button" data-theme="dark">深色</button>
+      </div>
+      <div class="control-group" aria-label="窗口密度">
+        <button type="button" data-density="compact">紧凑</button>
+        <button type="button" data-density="expanded" class="is-active">展开</button>
+      </div>
+    </nav>
+
+    <section class="app-window" aria-label="AiTool 主窗口">
+      <header class="titlebar">
+        <span class="app-mark" aria-hidden="true">A</span>
+        <span class="window-title">AiTool</span>
+        <span class="window-context">文件中转与快捷动作</span>
+        <div class="window-controls" aria-label="窗口控制">
+          <button class="window-control" type="button" aria-label="最小化"><svg class="icon"><use href="#i-minus"></use></svg></button>
+          <button class="window-control" type="button" aria-label="最大化"><svg class="icon"><use href="#i-maximize"></use></svg></button>
+          <button class="window-control close" type="button" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button>
+        </div>
+      </header>
+
+      <section class="station" aria-labelledby="station-title">
+        <div class="section-heading">
+          <div class="heading-copy">
+            <div class="heading-line">
+              <h1 class="section-title" id="station-title">中转站</h1>
+              <span class="count-badge">3</span>
+            </div>
+            <p class="section-description">临时保留的文件与网址，可拖出到其他窗口</p>
+          </div>
+          <div class="station-actions">
+            <button class="quiet-button" type="button"><svg class="icon"><use href="#i-copy"></use></svg>全部复制</button>
+            <button class="icon-button" type="button" aria-label="置顶" title="置顶"><svg class="icon"><use href="#i-pin"></use></svg></button>
+          </div>
+        </div>
+
+        <div class="station-list" role="list" aria-label="中转站内容">
+          <div class="station-row is-selected" role="listitem">
+            <span class="file-icon"><svg class="icon"><use href="#i-folder"></use></svg></span>
+            <div><div class="file-name">release-candidate</div><div class="file-path">D:\Projects\AiTool\build\release-candidate</div></div>
+            <div class="file-detail">今天 14:32<span>文件夹 · 24 项</span></div>
+            <div class="row-actions"><button class="icon-button" type="button" aria-label="复制"><svg class="icon"><use href="#i-copy"></use></svg></button><button class="icon-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </div>
+          <div class="station-row" role="listitem">
+            <span class="file-icon"><svg class="icon"><use href="#i-file"></use></svg></span>
+            <div><div class="file-name">deploy-notes.md</div><div class="file-path">D:\Projects\AiTool\docs\deploy-notes.md</div></div>
+            <div class="file-detail">昨天 18:06<span>Markdown · 8 KB</span></div>
+            <div class="row-actions"><button class="icon-button" type="button" aria-label="复制"><svg class="icon"><use href="#i-copy"></use></svg></button><button class="icon-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </div>
+          <div class="station-row" role="listitem">
+            <span class="file-icon"><svg class="icon"><use href="#i-globe"></use></svg></span>
+            <div><div class="file-name">Jenkins · AiTool / release</div><div class="file-path">https://jenkins.example.local/job/aitool-release</div></div>
+            <div class="file-detail">周一 09:15<span>网址</span></div>
+            <div class="row-actions"><button class="icon-button" type="button" aria-label="复制"><svg class="icon"><use href="#i-copy"></use></svg></button><button class="icon-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </div>
+        </div>
+        <div class="station-drop" aria-label="拖入目标示意">
+          <svg class="icon"><use href="#i-plus"></use></svg>
+          <div><span class="drop-title">拖入文件、文件夹或网址</span><span class="drop-subtitle">松开后加入中转站</span></div>
+          <span class="drop-key">Ctrl + V</span>
+        </div>
+      </section>
+
+      <section class="actions-panel" aria-labelledby="actions-title">
+        <div class="actions-heading">
+          <div class="heading-line">
+            <h2 class="section-title" id="actions-title">快捷动作</h2>
+            <p class="section-description">常用操作</p>
+          </div>
+          <div class="actions-tools">
+            <button class="filter-button" type="button"><svg class="icon"><use href="#i-filter"></use></svg>全部</button>
+            <button class="icon-button add-button" type="button" aria-label="添加快捷动作" title="添加快捷动作"><svg class="icon"><use href="#i-plus"></use></svg></button>
+          </div>
+        </div>
+
+        <div class="action-scroll" aria-label="快捷动作列表">
+          <article class="action-row is-hover">
+            <div class="action-icon"><svg class="icon"><use href="#i-copy"></use></svg></div>
+            <div><div class="action-title">文件夹覆盖复制</div><div class="action-description">将中转站内容覆盖复制到指定目录</div></div>
+            <div class="action-meta">文件操作<span><kbd>Alt + 1</kbd></span></div>
+            <div class="action-controls"><button class="execute-button" type="button"><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <article class="action-row is-selected">
+            <div class="action-icon"><svg class="icon"><use href="#i-terminal"></use></svg></div>
+            <div><div class="action-title">启动脚本</div><div class="action-description">运行 .bat、.cmd 或 Python 脚本</div></div>
+            <div class="action-meta">脚本<span><kbd>Alt + 2</kbd></span></div>
+            <div class="action-controls"><button class="execute-button" type="button"><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <article class="action-row">
+            <div class="action-icon"><svg class="icon"><use href="#i-sync"></use></svg></div>
+            <div><div class="action-title">SVN 更新</div><div class="action-description">更新当前工作副本并保留本地修改</div></div>
+            <div class="action-meta">版本控制<span><kbd>Alt + 3</kbd></span></div>
+            <div class="action-controls"><button class="execute-button" type="button"><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <article class="action-row">
+            <div class="action-icon"><svg class="icon"><use href="#i-browser"></use></svg></div>
+            <div><div class="action-title">打开 Jenkins</div><div class="action-description">在默认浏览器打开构建与发布页面</div></div>
+            <div class="action-meta">网址<span>浏览器</span></div>
+            <div class="action-controls"><button class="execute-button" type="button"><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <article class="action-row">
+            <div class="action-icon"><svg class="icon"><use href="#i-explorer"></use></svg></div>
+            <div><div class="action-title">打开资源管理器</div><div class="action-description">打开当前项目目录，方便继续处理文件</div></div>
+            <div class="action-meta">系统工具<span>文件夹</span></div>
+            <div class="action-controls"><button class="execute-button" type="button"><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多"><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <article class="action-row is-disabled" aria-disabled="true">
+            <div class="action-icon"><svg class="icon"><use href="#i-settings"></use></svg></div>
+            <div><div class="action-title">清理临时目录</div><div class="action-description">尚未配置清理范围，暂不可执行</div></div>
+            <div class="action-meta">未配置<span>需要设置</span></div>
+            <div class="action-controls"><button class="execute-button" type="button" disabled><svg class="icon"><use href="#i-play"></use></svg><span>执行</span></button><button class="icon-button more-button" type="button" aria-label="更多" disabled><svg class="icon"><use href="#i-more"></use></svg></button></div>
+          </article>
+          <div class="info-bar" role="status"><svg class="icon"><use href="#i-info"></use></svg><span>中转站已准备好，可从列表选择一个快捷动作</span><span class="info-time">刚刚</span></div>
+        </div>
+      </section>
+
+      <footer class="statusbar">
+        <span class="status-dot" aria-hidden="true"></span><span>就绪</span>
+        <span class="status-detail">已置顶 · 中转站 3 项</span>
+        <span class="status-version">v0.9.4</span>
+      </footer>
+    </section>
+
+    <aside class="design-note">
+      <strong>设计依据</strong>
+      <code>Mica-like opaque base</code> · <code>Acrylic only for transient UI</code><br>
+      <code>4/8px corner hierarchy</code> · <code>neutral surfaces + semantic accent</code>
+    </aside>
+  </main>
+
+  <script>
+    (function () {
+      const root = document.getElementById('prototype');
+      const themeButtons = document.querySelectorAll('[data-theme]');
+      const densityButtons = document.querySelectorAll('[data-density]');
+
+      themeButtons.forEach(function (button) {
+        button.addEventListener('click', function () {
+          const dark = button.dataset.theme === 'dark';
+          root.classList.toggle('theme-dark', dark);
+          themeButtons.forEach(function (item) { item.classList.toggle('is-active', item === button); });
+        });
+      });
+
+      densityButtons.forEach(function (button) {
+        button.addEventListener('click', function () {
+          const compact = button.dataset.density === 'compact';
+          root.classList.toggle('is-compact', compact);
+          densityButtons.forEach(function (item) { item.classList.toggle('is-active', item === button); });
+        });
+      });
+    }());
+  </script>
+</body>
+</html>

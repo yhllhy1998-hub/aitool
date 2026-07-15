@@ -1,6 +1,6 @@
-task_id: aitool-lightweight-cleanup
-current_table: lightweight_cleanup
-stage: 轻量化重构
+task_id: aitool-url-drop-repair
+current_table: url_drop_repair
+stage: 浏览器网址拖拽修复
 status: in_progress
 task_type: deliverable
 priority_level: 主线必解
@@ -13,12 +13,12 @@ allow_write:
   - tests/
   - run_desktop_tool.py
 next_step: >
-  轻量化清理已完成：移除已删除文件的残余测试、修复 write_scope_gate 硬依赖、
-  删除冲突的 build_exe.py、清理过时引用。验证测试与治理检查已通过，下一步：创建清理提交。
+  用户已确认源码 run_desktop_tool.py 支持直接拖拽网页；新版 EXE 已在未清理或覆盖
+  %APPDATA%/AiTool 的前提下生成，且用户配置与打包前备份一致。下一步：人工启动 dist
+  EXE，验证窗口标题、浏览器网址拖入、Ctrl+V 粘贴和既有卡片/中转站内容均正常。
 override:
   enabled: false
 history_note: >
-  2026-07-12 轻量化重构：删除母仓特定基建（send_msg/controller-registry/practice-registry/
-  skill-governance/self-evolution-architecture）、无关脚本（website_probe）、过期文档。
-  .agent/ 从 26 文件降到 13，handbook 从 406 行降到 43 行。
-  保留核心三件套 + 护栏 + 打包脚本。
+  2026-07-13 接到用户报告：浏览器网址无法直接拖入。只读审查确认 DND_TEXT 顶层导入、
+  全树递归注册、刷新后重注册和 URL 识别优先级均为不可回退机制；顶层窗口缺少 <<Drop>>
+  绑定是首要最小修复候选，且现有代码缺少 URL 拖拽无 GUI 回归测试。

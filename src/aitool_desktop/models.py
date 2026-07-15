@@ -20,10 +20,14 @@ class StationEntry:
 
     @classmethod
     def from_dict(cls, payload: dict[str, str]) -> "StationEntry":
+        if not isinstance(payload, dict):
+            raise TypeError("station entry must be an object")
+        if not all(isinstance(payload.get(key), str) for key in ("path", "kind", "display_name")):
+            raise TypeError("station entry fields must be strings")
         return cls(
-            path=str(payload["path"]),
-            kind=str(payload["kind"]),
-            display_name=str(payload["display_name"]),
+            path=payload["path"],
+            kind=payload["kind"],
+            display_name=payload["display_name"],
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -32,6 +36,16 @@ class StationEntry:
             "kind": self.kind,
             "display_name": self.display_name,
         }
+
+
+@dataclass(slots=True)
+class StationState:
+    """中转站持久化状态（v2）。"""
+
+    entries: list[StationEntry] = field(default_factory=list)
+    sort_mode: str = "default"
+    custom_order: list[str] = field(default_factory=list)
+    updated_at: str = ""
 
 
 @dataclass(slots=True)
