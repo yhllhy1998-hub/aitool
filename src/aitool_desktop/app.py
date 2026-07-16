@@ -38,6 +38,7 @@ from .theme import (
     toggle_theme_mode,
 )
 from .window_geometry import (
+    DEFAULT_WINDOW_WIDTH,
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
     WorkArea,
@@ -834,10 +835,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._dock_resize_blocked = False
         self._dock_expected_geometry: WindowGeometry | None = None
         self._dock_expected_outer_position: tuple[int, int] | None = None
+        self._height_resizing = False
+        self._height_resize_origin = None
         self._last_observed_geometry: WindowGeometry | None = None
         self._dnd_target_widgets = weakref.WeakSet()
         self._expanded_geometry: WindowGeometry | None = None
         self._tray_restore_was_docked = False
+        self._tray_hidden = False
         self._dock_handle_height = 30
         self._init_storage()
         self._init_window()
@@ -1444,7 +1448,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _observe_window_position(self) -> None:
         """Use Configure as the native-titlebar move signal, never global Motion."""
 
-        if self._geometry_restoring or self._dock_restore_blocked or self._dock_dragging:
+        if (
+            self._geometry_restoring
+            or self._dock_restore_blocked
+            or self._dock_dragging
+            or getattr(self, "_height_resizing", False)
+        ):
             return
         geometry = self._current_window_geometry()
         if geometry is None:
@@ -1542,6 +1551,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             or self._dock_pause_count
             or self._dock_native_interaction
             or self._dock_resize_blocked
+            or getattr(self, "_height_resizing", False)
             or self._window_is_maximized()
             or self._dock_state != "free"
         ):
@@ -1929,6 +1939,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             } else self._current_window_geometry()
             if candidate is None:
                 return
+            # The native frame is intentionally non-resizable horizontally.
+            # Keep persisted geometry compatible with that contract even if a
+            # stale or foreign geometry object reaches this path.
+            candidate = WindowGeometry(
+                candidate.x,
+                candidate.y,
+                DEFAULT_WINDOW_WIDTH,
+                candidate.height,
+            )
             save_window_geometry(WINDOW_GEOMETRY_PATH, candidate)
         except Exception as exc:
             logger.debug("window geometry save skipped: %s", exc)
@@ -2035,6 +2054,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             primary_index=primary_index,
         )
         work_area = select_work_area(restored, work_areas, primary_index=primary_index)
+        fixed_width = min(DEFAULT_WINDOW_WIDTH, work_area.width)
+        restored = WindowGeometry(
+            min(max(restored.x, work_area.left), work_area.right - fixed_width),
+            restored.y,
+            fixed_width,
+            restored.height,
+        )
         self.minsize(
             min(MIN_WINDOW_WIDTH, work_area.width),
             min(MIN_WINDOW_HEIGHT, work_area.height),
@@ -2042,6 +2068,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         x_geometry = f"+{restored.x}" if restored.x >= 0 else str(restored.x)
         y_geometry = f"+{restored.y}" if restored.y >= 0 else str(restored.y)
         self.geometry(f"{restored.width}x{restored.height}{x_geometry}{y_geometry}")
+        self.resizable(False, False)
         self._expanded_geometry = restored
         self.configure(fg_color=self._t("background"))
         self.attributes("-topmost", True)
@@ -2111,7 +2138,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             
             def _toggle_gui():
                 # 收起只是顶部停靠状态，不等同于托盘隐藏。
-                if not self.winfo_viewable():
+                if self._tray_hidden or not self.winfo_viewable():
                     self.after(0, self._restore_from_tray)
                 elif self._dock_state in ("collapsed", "collapsing", "expanding"):
                     self.after(0, self._request_dock_expand)
@@ -2180,6 +2207,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         """显示设置弹窗。为了保证在主窗口被隐藏（withdraw）时也能正常设置，在主线程中唤起设置弹窗。"""
         def _build_dialog():
             self._cancel_dock_jobs()
+            self._tray_hidden = False
             self.deiconify()
             restored = self._expanded_geometry or self._current_window_geometry()
             if restored is not None:
@@ -2258,6 +2286,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _minimize_to_tray(self) -> None:
         """隐藏窗口并在系统托盘中生成一个精美的托盘图标。"""
+        self._tray_hidden = True
         self._tray_restore_was_docked = self._dock_state in {
             "docked_expanded", "collapsing", "collapsed", "expanding",
         }
@@ -2268,45 +2297,50 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._remember_expanded_geometry(self._current_window_geometry())
         self._save_window_geometry_now()
         self.withdraw() # 隐藏主窗口
-
-        # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
-        if not self._tray_icon:
-            import pystray
-
-            # 使用统一绘制的高颜值科技图标
-            img = self._create_app_icon()
-
-            def _show_app(icon, item):
-                """双击或者右键菜单点击‘显示主界面’时，将窗口复原并最前展示"""
-                icon.stop()
-                self._tray_icon = None
-                self.after(0, self._restore_from_tray)
-
-            def _quit_app(icon, item):
-                """彻底安全退出应用，清除托盘"""
-                self.after(0, self._quit_from_tray)
-
-            def _get_startup_menu_label(item):
-                return "✓ 开机自启动" if self._get_startup_status() else "开机自启动"
-
-            menu = pystray.Menu(
-                pystray.MenuItem("打开 AiTool", _show_app, default=True), # 设为双击默认动作
-                pystray.MenuItem("设置中心", self._show_settings_dialog),
-                pystray.MenuItem(_get_startup_menu_label, self._toggle_startup),
-                pystray.MenuItem("彻底退出", _quit_app)
-            )
-
-            self._tray_icon = pystray.Icon("AiTool", img, "AiTool 桌面工具", menu)
-            
-            # 使用 threading 启动托盘图标轮询监听，防止阻塞 Tkinter 的 mainloop 主线程！
-            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        self._ensure_tray_icon()
 
         self._toast("AiTool 已最小化到托盘常驻后台", "success")
+
+    def _ensure_tray_icon(self) -> None:
+        """创建并启动托盘图标；隐藏和恢复之间始终复用同一个图标。"""
+        if self._tray_icon is not None:
+            return
+
+        # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
+        import pystray
+
+        # 使用统一绘制的高颜值科技图标
+        img = self._create_app_icon()
+
+        def _show_app(icon, item):
+            """从托盘菜单调度主窗口恢复，保留托盘图标。"""
+            self.after(0, self._restore_from_tray)
+
+        def _quit_app(icon, item):
+            """彻底安全退出应用，清除托盘"""
+            self.after(0, self._quit_from_tray)
+
+        def _get_startup_menu_label(item):
+            return "✓ 开机自启动" if self._get_startup_status() else "开机自启动"
+
+        menu = pystray.Menu(
+            pystray.MenuItem("打开 AiTool", _show_app, default=True), # 设为双击默认动作
+            pystray.MenuItem("设置中心", self._show_settings_dialog),
+            pystray.MenuItem(_get_startup_menu_label, self._toggle_startup),
+            pystray.MenuItem("彻底退出", _quit_app)
+        )
+
+        self._tray_icon = pystray.Icon("AiTool", img, "AiTool 桌面工具", menu)
+
+        # 使用 threading 启动托盘图标轮询监听，防止阻塞 Tkinter 的 mainloop 主线程！
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+
 
     def _restore_from_tray(self) -> None:
         """从托盘恢复窗口显示"""
         self._cancel_dock_jobs()
         self._dock_restore_blocked = True
+        self._tray_hidden = False
         self.deiconify()
         self.attributes("-topmost", self._pinned)
         self.focus_force()
@@ -2345,15 +2379,122 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=0)
         self.content.grid_rowconfigure(1, weight=1)
+        self.content.grid_rowconfigure(2, weight=0)
         self._register_dnd_target(self.content)
 
         self._build_station_area()
         self._build_card_area()
+        self._build_height_resize_grip()
         self._build_statusbar()
 
         self.bind_all("<Control-v>", self._on_paste)
         self.bind("<Enter>", self._on_dock_enter, add="+")
         self.bind("<Leave>", self._on_dock_leave, add="+")
+
+    def _build_height_resize_grip(self) -> None:
+        """Build the internal, vertical-only height resize target."""
+
+        self._height_resize_grip = ctk.CTkFrame(
+            self.content,
+            height=6,
+            fg_color=self._t("surface"),
+            border_width=1,
+            border_color=self._t("border"),
+            corner_radius=0,
+            cursor="sb_v_double_arrow",
+        )
+        self._height_resize_grip.grid(row=2, column=0, sticky="ew")
+        self._height_resize_grip.grid_propagate(False)
+        self._height_resize_grip.bind("<Button-1>", self._on_height_grip_press, add="+")
+        self._height_resize_grip.bind("<B1-Motion>", self._on_height_grip_motion, add="+")
+        self._height_resize_grip.bind("<ButtonRelease-1>", self._on_height_grip_release, add="+")
+
+    def _on_height_grip_press(self, event) -> None:
+        """Start a height-only drag when normal free geometry owns the window."""
+
+        if (
+            self._dock_state != "free"
+            or self._geometry_restoring
+            or getattr(self, "_tray_hidden", False)
+        ):
+            return
+
+        try:
+            geometry = self._current_window_geometry()
+            if geometry is None:
+                return
+            work_area = self._dock_area_for_geometry(geometry)
+            if work_area is None:
+                return
+            self._cancel_dock_job("_dock_debounce_job")
+            self._cancel_dock_job("_dock_autohide_job")
+            self._cancel_geometry_save_job()
+            self._height_resizing = True
+            self._height_resize_origin = (
+                int(event.x_root),
+                int(event.y_root),
+                geometry.x,
+                geometry.y,
+                geometry.height,
+                work_area.height,
+            )
+        except Exception:
+            # Tk can destroy or remap the grip between the button event and
+            # this callback.  A failed press must never leave resize mode set.
+            self._height_resizing = False
+            self._height_resize_origin = None
+
+    def _on_height_grip_motion(self, event) -> None:
+        """Apply the pointer delta to height without persisting each frame."""
+
+        if not self._height_resizing or self._height_resize_origin is None:
+            return
+        if (
+            self._dock_state != "free"
+            or self._geometry_restoring
+            or getattr(self, "_tray_hidden", False)
+        ):
+            return
+
+        try:
+            _origin_x, origin_y, _start_x, _start_y, start_height, max_height = self._height_resize_origin
+            geometry = self._current_window_geometry()
+            if geometry is None:
+                return
+            work_area = self._dock_area_for_geometry(geometry)
+            if work_area is None:
+                return
+            max_height = min(max_height, work_area.height)
+            min_height = min(MIN_WINDOW_HEIGHT, max_height)
+            height = min(
+                max(start_height + int(event.y_root) - origin_y, min_height),
+                max_height,
+            )
+            width = min(DEFAULT_WINDOW_WIDTH, work_area.width)
+            target = WindowGeometry(geometry.x, geometry.y, width, height)
+            # Keep Configure/save handling behind the existing acknowledgement
+            # fence; only release schedules the disk write.
+            self._set_window_geometry(target, write_geometry=False)
+            self.geometry(self._geometry_to_string(target))
+        except Exception:
+            # Ignore Tkinter.TclError when the window is withdrawn or destroyed
+            # while the pointer is still held.
+            return
+
+    def _on_height_grip_release(self, _event=None) -> None:
+        """End a height drag and reuse the normal debounced geometry save."""
+
+        if not self._height_resizing:
+            return
+        self._height_resizing = False
+        self._height_resize_origin = None
+        self._clear_expected_geometry()
+        if (
+            self._dock_state == "free"
+            and not self._geometry_restoring
+            and not getattr(self, "_tray_hidden", False)
+        ):
+            self._schedule_geometry_save()
 
     def _build_station_area(self) -> None:
         import tkinter as tk
@@ -2399,11 +2540,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_dnd_recursive(header)
 
         self.station_scroll = ctk.CTkFrame(self.station_section, fg_color=self._t("surface"), corner_radius=0)
-        self.station_scroll.grid(row=1, column=0, sticky="nsew", padx=SPACING["sm"], pady=(0, SPACING["sm"]))
+        self.station_scroll.grid(row=1, column=0, sticky="nsew", padx=(SPACING["sm"], 0), pady=(0, SPACING["sm"]))
         self.station_scroll.grid_columnconfigure(0, weight=1)
         self.station_scroll.grid_rowconfigure(0, weight=1)
         self._register_dnd_target(self.station_scroll)
-        self._station_canvas = tk.Canvas(self.station_scroll, bg=self._t("canvas"), highlightthickness=0, bd=0)
+        self._station_canvas = tk.Canvas(self.station_scroll, bg=self._t("surface"), highlightthickness=0, bd=0)
         self.station_scrollbar = ctk.CTkScrollbar(
             self.station_scroll, command=self._station_canvas.yview,
             fg_color=self._t("surface"), button_color=self._t("scrollbar"),
@@ -2411,12 +2552,25 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self._station_canvas.grid(row=0, column=0, sticky="nsew")
         self.station_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.station_scrollbar.grid_remove()
         self._station_item_host = ctk.CTkFrame(self._station_canvas, fg_color=self._t("surface"), corner_radius=0)
         self._station_item_host.grid_columnconfigure(0, weight=1)
         self._station_canvas_window = self._station_canvas.create_window((0, 0), window=self._station_item_host, anchor="nw")
         self._station_canvas.configure(yscrollcommand=self.station_scrollbar.set)
-        self._station_item_host.bind("<Configure>", lambda e: self._station_canvas.configure(scrollregion=self._station_canvas.bbox("all")))
-        self._station_canvas.bind("<Configure>", lambda e: self._station_canvas.itemconfigure(self._station_canvas_window, width=e.width))
+        self._station_item_host.bind(
+            "<Configure>",
+            lambda e: (
+                self._station_canvas.configure(scrollregion=self._station_canvas.bbox("all")),
+                self.after_idle(lambda: self._sync_scrollbar_visibility(self._station_canvas, self.station_scrollbar)),
+            ),
+        )
+        self._station_canvas.bind(
+            "<Configure>",
+            lambda e: (
+                self._station_canvas.itemconfigure(self._station_canvas_window, width=e.width),
+                self.after_idle(lambda: self._sync_scrollbar_visibility(self._station_canvas, self.station_scrollbar)),
+            ),
+        )
         self._station_canvas.bind("<MouseWheel>", self._on_station_mousewheel)
         self._station_item_host.bind("<MouseWheel>", self._on_station_mousewheel)
         self.station_frame = self._station_item_host
@@ -2429,6 +2583,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_dnd_target(self._station_canvas)
         self._register_dnd_target(self._station_item_host)
         self._register_dnd_recursive(self.station_scroll)
+        self.after_idle(lambda: self._sync_scrollbar_visibility(self._station_canvas, self.station_scrollbar))
 
     def _build_card_area(self) -> None:
         import tkinter as tk
@@ -2446,12 +2601,25 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self._actions_canvas.grid(row=0, column=0, sticky="nsew")
         self.actions_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.actions_scrollbar.grid_remove()
         self._action_item_host = ctk.CTkFrame(self._actions_canvas, fg_color=self._t("background"), corner_radius=0)
         self._action_item_host.grid_columnconfigure(0, weight=1)
         self._actions_canvas_window = self._actions_canvas.create_window((0, 0), window=self._action_item_host, anchor="nw")
         self._actions_canvas.configure(yscrollcommand=self.actions_scrollbar.set)
-        self._action_item_host.bind("<Configure>", lambda e: self._actions_canvas.configure(scrollregion=self._actions_canvas.bbox("all")))
-        self._actions_canvas.bind("<Configure>", lambda e: self._actions_canvas.itemconfigure(self._actions_canvas_window, width=e.width))
+        self._action_item_host.bind(
+            "<Configure>",
+            lambda e: (
+                self._actions_canvas.configure(scrollregion=self._actions_canvas.bbox("all")),
+                self.after_idle(lambda: self._sync_scrollbar_visibility(self._actions_canvas, self.actions_scrollbar)),
+            ),
+        )
+        self._actions_canvas.bind(
+            "<Configure>",
+            lambda e: (
+                self._actions_canvas.itemconfigure(self._actions_canvas_window, width=e.width),
+                self.after_idle(lambda: self._sync_scrollbar_visibility(self._actions_canvas, self.actions_scrollbar)),
+            ),
+        )
         self._actions_canvas.bind("<MouseWheel>", self._on_mousewheel)
         self._action_item_host.bind("<MouseWheel>", self._on_mousewheel)
         self.card_scroll = self.actions_scroll
@@ -2459,6 +2627,28 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_dnd_target(self._actions_canvas)
         self._register_dnd_target(self._action_item_host)
         self._register_dnd_recursive(self.actions_scroll)
+        self.after_idle(lambda: self._sync_scrollbar_visibility(self._actions_canvas, self.actions_scrollbar))
+
+    def _sync_scrollbar_visibility(self, canvas, scrollbar) -> None:
+        """Show a scrollbar only when its content exceeds the canvas viewport."""
+
+        import tkinter as tk
+
+        try:
+            viewport_height = canvas.winfo_height()
+            if viewport_height <= 1:
+                return
+
+            bounds = canvas.bbox("all")
+            content_height = 0 if bounds is None else bounds[3] - bounds[1]
+            if content_height <= viewport_height:
+                canvas.yview_moveto(0)
+                scrollbar.grid_remove()
+            else:
+                scrollbar.grid(row=0, column=1, sticky="ns")
+        except tk.TclError:
+            # Tk may destroy a just-refreshed item while an idle callback runs.
+            return
 
     def _build_statusbar(self) -> None:
         import tkinter as tk
@@ -2575,11 +2765,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 font=ctk.CTkFont(family=FONT, size=FS["status"]), text_color=self._t("muted"))
             self.station_empty_label.pack(expand=True, pady=SPACING["sm"])
             self._register_dnd_recursive(self.station_frame)
+            self.after_idle(lambda: self._sync_scrollbar_visibility(self._station_canvas, self.station_scrollbar))
             return
 
         for entry in self.entries:
             self._create_station_item(entry)
         self._register_dnd_recursive(self.station_frame)
+        self.after_idle(lambda: self._sync_scrollbar_visibility(self._station_canvas, self.station_scrollbar))
 
     def _create_station_item(self, entry: StationEntry) -> None:
         import tkinter as tk
@@ -2719,6 +2911,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         lbl_tip.bind("<Button-1>", lambda event: self._show_user_guide(manual=True))
 
         self._register_dnd_recursive(self._action_item_host)
+        self.after_idle(lambda: self._sync_scrollbar_visibility(self._actions_canvas, self.actions_scrollbar))
 
     def _get_all_cards(self) -> list[dict]:
         cards = []
@@ -3597,29 +3790,35 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         textbox.pack(padx=20, pady=4)
 
         instructions = (
-            "🚀 智能极客拖放矩阵\n"
+            "🚀 AiTool 使用说明\n"
             "========================================\n"
-            "您可以把任何东西扔进本界面的任意角落：\n\n"
-            "  1. 🌐 拖入网页链接 / .url 文件\n"
-            "     --> 自动为您生成一键「网页跳转卡片」！\n\n"
-            "  2. 🚀 拖入 .exe 程序 / 桌面快捷方式 (.lnk)\n"
-            "     --> 自动为您生成一键「启动应用程序卡片」！\n\n"
-            "  3. ⚡ 拖入 .bat / .cmd / .py 脚本\n"
-            "     --> 自动为您生成一键「静默脚本执行卡片」！\n\n"
-            "  4. 📁 拖入其它格式（.zip, .xlsx, 普通目录...）\n"
-            "     --> 自动收藏进上方「中转站」供后续流转！\n\n\n"
-            "📂 高频双通道资源覆盖\n"
+            "📐 窗口与停靠\n"
             "========================================\n"
-            "  在双通道资源覆盖模块中，双击可同时执行两组路径同步。\n"
-            "  - 源路径 1 (配置文件的 autocode) -> 共享文件夹\n"
-            "  - 源路径 2 (配置文件的 LuaFile) -> Unity 的 Data 路径\n\n\n"
-            "📋 基础中转站交互\n"
+            "  - 默认大小为 320 × 640，位置在当前主显示器工作区左上角。\n"
+            "  - 已保存的有效窗口位置和高度会优先恢复。窗口宽度固定为 320px。\n"
+            "  - 底部状态栏上方的纵向拖拽区域可以调整高度，调整结果会保存。\n"
+            "  - 将窗口拖到屏幕顶部并停留即可停靠；鼠标离开后会自动收起，\n"
+            "    只露出约 30px 的横条。鼠标移入横条即可展开。\n"
+            "  - 顶部收起与隐藏到系统托盘是两种独立方式。\n\n"
+            "⌨️ 快捷键与托盘\n"
             "========================================\n"
-            "  - 双击：打开文件/文件夹\n"
-            "  - ✕ 按钮：安全地将文件从中转站移除\n"
-            "  - 拖出：可以直接把文件拖放回系统桌面或目录！\n"
+            "  - Alt+A：正常显示时隐藏到 Windows 右下角系统托盘；\n"
+            "    托盘隐藏时恢复窗口；顶部横条收起时展开顶部窗口。\n"
+            "  - 关闭按钮会隐藏到系统托盘，不会直接退出程序。托盘菜单提供：\n"
+            "    打开 AiTool、设置中心、开机自启动切换、彻底退出。\n\n"
+            "📥 拖放、粘贴与中转站\n"
             "========================================\n"
-            "      尽情体验无负担、零摩擦的极致操作吧！"
+            "  - 窗口显示时，可拖放网址、脚本、应用、普通文件或文件夹。\n"
+            "  - Ctrl+V 可粘贴网址或路径；托盘隐藏时主窗口不接收拖放。\n"
+            "  - 中转站条目支持双击打开、右键定位，以及拖出复制。\n"
+            "  - 快捷动作支持添加、编辑、删除和执行。\n\n"
+            "🎨 其他设置\n"
+            "========================================\n"
+            "  - 主题按钮可切换亮色/暗色，置顶按钮可切换窗口置顶。\n"
+            "  - 配置保存在 %APPDATA%\\AiTool\\；源码运行时保存在项目 data 目录。\n"
+            "  - 更新 EXE 不会覆盖已有的用户配置。\n"
+            "========================================\n"
+            "      祝您使用愉快！"
         )
         
         textbox.insert("1.0", instructions)

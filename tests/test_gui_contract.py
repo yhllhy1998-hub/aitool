@@ -330,6 +330,53 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("self._dock_native_interaction", autohide)
         self.assertIn("self._dock_resize_blocked", autohide)
 
+    def test_internal_height_resize_grip_is_vertical_only_and_dock_safe(self) -> None:
+        init = _source(_function("__init__"))
+        build = _source(_function("_build_height_resize_grip"))
+        press = _source(_function("_on_height_grip_press"))
+        motion = _source(_function("_on_height_grip_motion"))
+        release = _source(_function("_on_height_grip_release"))
+        observe = _source(_function("_observe_window_position"))
+        debounce = _source(_function("_on_top_debounce"))
+
+        self.assertIn("self._height_resizing = False", init)
+        self.assertIn("self._height_resize_origin = None", init)
+        for binding in (
+            '"<Button-1>"',
+            '"<B1-Motion>"',
+            '"<ButtonRelease-1>"',
+        ):
+            self.assertIn(binding, build)
+        self.assertIn('cursor="sb_v_double_arrow"', build)
+        self.assertIn('fg_color=self._t("surface")', build)
+        self.assertIn('border_color=self._t("border")', build)
+        self.assertIn('self._height_resize_grip.grid(row=2, column=0', build)
+        self.assertIn('self._dock_state != "free"', press)
+        self.assertIn("self._geometry_restoring", press)
+        self.assertIn('getattr(self, "_tray_hidden", False)', press)
+        self.assertIn("self._height_resizing = True", press)
+        self.assertIn("event.y_root", motion)
+        self.assertIn("MIN_WINDOW_HEIGHT", motion)
+        self.assertIn("work_area.height", motion)
+        self.assertIn("write_geometry=False", motion)
+        self.assertIn("self._height_resizing = False", release)
+        self.assertIn("self._schedule_geometry_save()", release)
+        self.assertIn('getattr(self, "_height_resizing", False)', observe)
+        self.assertIn('getattr(self, "_height_resizing", False)', debounce)
+
+    def test_fixed_width_and_non_snap_native_style_contract_remain_explicit(self) -> None:
+        init = _source(_function("_init_window"))
+        style = _source(_function("_disable_native_resize_and_maximize"))
+        save = _source(_function("_save_window_geometry_now"))
+
+        self.assertIn("DEFAULT_WINDOW_WIDTH", init)
+        self.assertIn("self.resizable(False, False)", init)
+        self.assertIn("DEFAULT_WINDOW_WIDTH", save)
+        self.assertIn("WS_THICKFRAME", style)
+        self.assertIn("WS_SIZEBOX", style)
+        self.assertIn("WS_MAXIMIZEBOX", style)
+        self.assertIn("style_mask", style)
+
     def test_native_titlebar_style_removes_resize_and_snap_capabilities(self) -> None:
         style = _source(_function("_disable_native_resize_and_maximize"))
         for symbol in (
@@ -450,6 +497,37 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("self.deiconify()", restore)
         self.assertNotIn("_schedule_native_window_style_reapply", restore)
         self.assertIn('self.bind("<Map>", self._reapply_native_window_style_after_map, add="+")', schedule)
+
+    def test_tray_hidden_visibility_state_is_separate_from_top_docking(self) -> None:
+        init = _source(_function("__init__"))
+        minimize = _source(_function("_minimize_to_tray"))
+        restore = _source(_function("_restore_from_tray"))
+        settings = _source(_function("_show_settings_dialog"))
+
+        self.assertIn("self._tray_hidden = False", init)
+        self.assertIn("self._tray_hidden = True", minimize)
+        self.assertIn("self.withdraw()", minimize)
+        self.assertIn("self._ensure_tray_icon()", minimize)
+        self.assertIn("self._tray_hidden = False", restore)
+        self.assertIn("self.deiconify()", restore)
+        self.assertIn("self._tray_hidden = False", settings)
+
+    def test_tray_icon_is_persistent_until_explicit_quit(self) -> None:
+        ensure = _source(_function("_ensure_tray_icon"))
+        quit_source = _source(_function("_quit_from_tray"))
+
+        self.assertIn("def _ensure_tray_icon", APP_SOURCE)
+        self.assertIn("self._tray_icon is not None", ensure)
+        self.assertIn("self.after(0, self._restore_from_tray)", ensure)
+        self.assertNotIn("icon.stop()", ensure)
+        self.assertNotIn("self._tray_icon = None", ensure)
+        self.assertIn("tray_icon.stop()", quit_source)
+
+    def test_top_docking_collapsed_state_remains_distinct_from_tray_hidden(self) -> None:
+        hotkey = _source(_function("_setup_global_hotkey"))
+        self.assertIn('self._dock_state in ("collapsed", "collapsing", "expanding")', hotkey)
+        self.assertIn('self._dock_state = "collapsed"', APP_SOURCE)
+        self.assertIn('"docked_expanded", "collapsing", "collapsed", "expanding"', APP_SOURCE)
 
     def test_native_style_uses_pointer_sized_ctypes_and_verifies_second_read(self) -> None:
         class FakeGetWindowLongPtr:

@@ -16,8 +16,8 @@ from typing import Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
-DEFAULT_WINDOW_WIDTH = 360
-DEFAULT_WINDOW_HEIGHT = 580
+DEFAULT_WINDOW_WIDTH = 320
+DEFAULT_WINDOW_HEIGHT = 640
 MIN_WINDOW_WIDTH = 320
 MIN_WINDOW_HEIGHT = 420
 MAX_WINDOW_DIMENSION = 10_000
@@ -89,12 +89,12 @@ class InvalidGeometry(ValueError):
 
 
 def default_geometry(work_area: WorkArea | None = None) -> WindowGeometry:
-    """Return the historical narrow 360x580 geometry, centered when an area is given.
+    """Return the default 320x640 geometry at an area's top-left corner.
 
     With no work area this retains the historical origin-based value for the
     persistence/parser APIs.  Placement code passes the selected primary area
-    explicitly so that a missing or invalid saved value cannot accidentally
-    select a monitor based on the origin-based default's center.
+    explicitly so that a missing or invalid saved value uses that area's
+    top-left corner.
     """
 
     if work_area is None:
@@ -103,8 +103,8 @@ def default_geometry(work_area: WorkArea | None = None) -> WindowGeometry:
     else:
         if not isinstance(work_area, WorkArea):
             raise TypeError("work_area must be a WorkArea")
-        left = work_area.left + (work_area.width - DEFAULT_WINDOW_WIDTH) // 2
-        top = work_area.top + (work_area.height - DEFAULT_WINDOW_HEIGHT) // 2
+        left = work_area.left
+        top = work_area.top
     return WindowGeometry(left, top, DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
 
 
@@ -361,7 +361,7 @@ def load_and_place_window_geometry(
     *,
     primary_index: int = 0,
 ) -> WindowGeometry:
-    """Load and place geometry, centering a default on primary when invalid.
+    """Load and place geometry, using the primary area's top-left for defaults.
 
     Unlike :func:`load_window_geometry`, this composition keeps an invalid or
     missing file distinguishable from a valid origin-based geometry.  Such a

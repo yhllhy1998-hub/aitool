@@ -112,6 +112,47 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("self._station_item_host =", _method_source("_build_station_area"))
         self.assertIn("self._action_item_host =", _method_source("_build_card_area"))
 
+    def test_station_scrollbar_right_edge_matches_actions_scrollbar(self) -> None:
+        station = _method_source("_build_station_area")
+        actions = _method_source("_build_card_area")
+
+        self.assertIn(
+            'self.station_scroll.grid(row=1, column=0, sticky="nsew", padx=(SPACING["sm"], 0)',
+            station,
+        )
+        self.assertIn(
+            'self.actions_scroll.grid(row=1, column=0, sticky="nsew")',
+            actions,
+        )
+
+    def test_scrollbars_are_visibility_synced_after_layout_and_refresh(self) -> None:
+        sync = _method_source("_sync_scrollbar_visibility")
+        self.assertIn('canvas.bbox("all")', sync)
+        self.assertIn("canvas.yview_moveto(0)", sync)
+        self.assertIn("scrollbar.grid_remove()", sync)
+        self.assertIn('scrollbar.grid(row=0, column=1, sticky="ns")', sync)
+
+        for method_name in (
+            "_build_station_area",
+            "_build_card_area",
+            "_refresh_station",
+            "_refresh_cards",
+        ):
+            self.assertIn(
+                "_sync_scrollbar_visibility",
+                _method_source(method_name),
+                f"{method_name} must schedule scrollbar visibility synchronization",
+            )
+
+    def test_station_surface_token_covers_canvas_and_native_file_labels(self) -> None:
+        station = _method_source("_build_station_area")
+        item = _method_source("_create_station_item")
+
+        self.assertIn('tk.Canvas(self.station_scroll, bg=self._t("surface")', station)
+        self.assertIn('fg_color=self._t("surface")', station)
+        self.assertIn('tk.Label(item, bg=self._t("surface"))', item)
+        self.assertIn('bg=self._t("surface"), fg=name_fg', item)
+
     def test_refreshes_clear_only_their_named_item_hosts(self) -> None:
         station = _method_source("_refresh_station")
         cards = _method_source("_refresh_cards")
@@ -120,13 +161,13 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("w.destroy()", station)
         self.assertNotIn("_action_item_host", station)
         self.assertNotIn("statusbar", station)
-        self.assertNotIn("scrollbar", station)
+        self.assertNotIn("scrollbar.grid", station)
 
         self.assertIn("self._action_item_host.winfo_children()", cards)
         self.assertIn("w.destroy()", cards)
         self.assertNotIn("_station_item_host", cards)
         self.assertNotIn("statusbar", cards)
-        self.assertNotIn("scrollbar", cards)
+        self.assertNotIn("scrollbar.grid", cards)
 
     def test_refresh_code_has_no_implicit_child_order_dependency(self) -> None:
         """Indexing a child list is forbidden even when it looks harmless."""
@@ -156,6 +197,36 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("save_window_geometry", APP_SOURCE)
         self.assertIn("_schedule_geometry_save", APP_SOURCE)
         self.assertIn("self.after(350, self._save_window_geometry_now)", APP_SOURCE)
+
+    def test_fixed_width_restore_and_height_grip_are_wired_without_gui(self) -> None:
+        init = _method_source("_init_window")
+        save = _method_source("_save_window_geometry_now")
+        build = _method_source("_build_ui")
+        grip = _method_source("_build_height_resize_grip")
+
+        self.assertIn("DEFAULT_WINDOW_WIDTH", APP_SOURCE)
+        self.assertIn("fixed_width = min(DEFAULT_WINDOW_WIDTH, work_area.width)", init)
+        self.assertIn("restored.height", init)
+        self.assertIn("self.resizable(False, False)", init)
+        self.assertIn("DEFAULT_WINDOW_WIDTH", save)
+        self.assertIn("candidate = WindowGeometry(", save)
+
+        self.assertIn("self.content.grid_rowconfigure(2, weight=0)", build)
+        self.assertIn("self._build_height_resize_grip()", build)
+        self.assertIn("self._height_resize_grip =", grip)
+        self.assertIn("self._height_resize_grip.grid(row=2, column=0, sticky=\"ew\")", grip)
+        self.assertIn('fg_color=self._t("surface")', grip)
+        self.assertIn('border_color=self._t("border")', grip)
+        self.assertIn('cursor="sb_v_double_arrow"', grip)
+        self.assertNotIn("_register_dnd", grip)
+
+    def test_content_grip_does_not_change_root_statusbar_layout(self) -> None:
+        build = _method_source("_build_ui")
+        statusbar = _method_source("_build_statusbar")
+
+        self.assertIn("self.content.grid(row=0, column=0, sticky=\"nsew\")", build)
+        self.assertIn("self.statusbar.grid(row=1, column=0, sticky=\"ew\")", statusbar)
+        self.assertNotIn("statusbar.grid(row=2", build)
 
         self.assertIn("parse_theme_mode(", APP_SOURCE)
         self.assertIn("resolve_theme_mode(", APP_SOURCE)
