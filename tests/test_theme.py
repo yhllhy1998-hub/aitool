@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +23,9 @@ from aitool_desktop.theme import (  # noqa: E402
     get_theme_tokens,
     parse_theme_mode,
     resolve_theme,
+    toggle_theme_mode,
 )
+from aitool_desktop.app import _startup_theme_mode  # noqa: E402
 
 
 class ThemeTests(unittest.TestCase):
@@ -51,6 +55,10 @@ class ThemeTests(unittest.TestCase):
         "progress",
         "toast",
         "action_icon",
+        "add_button",
+        "add_button_hover",
+        "add_button_text",
+        "pin_text",
     }
     EXPECTED_ACTION_KINDS = {
         "folder-copy",
@@ -69,6 +77,15 @@ class ThemeTests(unittest.TestCase):
         self.assertEqual(resolve_theme("system", system_theme="dark"), "dark")
         self.assertEqual(parse_theme_mode("LIGHT"), "light")
         self.assertEqual(parse_theme_mode("not-a-theme"), "system")
+
+    def test_app_startup_defaults_to_dark_without_environment_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_startup_theme_mode(), "dark")
+
+    def test_app_startup_environment_override_accepts_all_supported_modes(self) -> None:
+        for mode in ("light", "dark", "system"):
+            with self.subTest(mode=mode):
+                self.assertEqual(_startup_theme_mode({"AITOOL_THEME": mode}), mode)
 
     def test_token_dicts_are_complete_and_defensive(self) -> None:
         expected = self.EXPECTED_TOKEN_KEYS
@@ -122,6 +139,9 @@ class ThemeTests(unittest.TestCase):
     def test_system_light_dark_and_invalid_effective_theme(self) -> None:
         self.assertEqual(resolve_theme("system", system_theme="light"), "light")
         self.assertEqual(resolve_theme("system", system_theme="dark"), "dark")
+        self.assertEqual(toggle_theme_mode("light"), "dark")
+        self.assertEqual(toggle_theme_mode("dark"), "light")
+        self.assertEqual(toggle_theme_mode("system", system_theme="light"), "dark")
         with self.assertRaises(ValueError):
             resolve_theme("system", system_theme="not-a-theme")
 

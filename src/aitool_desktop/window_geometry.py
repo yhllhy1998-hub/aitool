@@ -16,9 +16,9 @@ from typing import Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
-DEFAULT_WINDOW_WIDTH = 760
-DEFAULT_WINDOW_HEIGHT = 760
-MIN_WINDOW_WIDTH = 560
+DEFAULT_WINDOW_WIDTH = 360
+DEFAULT_WINDOW_HEIGHT = 580
+MIN_WINDOW_WIDTH = 320
 MIN_WINDOW_HEIGHT = 420
 MAX_WINDOW_DIMENSION = 10_000
 
@@ -89,7 +89,7 @@ class InvalidGeometry(ValueError):
 
 
 def default_geometry(work_area: WorkArea | None = None) -> WindowGeometry:
-    """Return the default 760x760 geometry, centered when an area is given.
+    """Return the historical narrow 360x580 geometry, centered when an area is given.
 
     With no work area this retains the historical origin-based value for the
     persistence/parser APIs.  Placement code passes the selected primary area

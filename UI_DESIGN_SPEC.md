@@ -1,364 +1,419 @@
-# AiTool Desktop UI 设计规范
+# AiTool UI Design Specification
 
-> 本文档是 `src/aitool_desktop/app.py` 的 UI 设计准则。修改界面前必读，避免重蹈覆辙。
-
----
-
-## 1. 框架与依赖
-
-| 项目 | 值 | 备注 |
-|------|-----|------|
-| GUI 框架 | CustomTkinter + tkinterdnd2 | 不要用 pywebview |
-| 外壳类 | `DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper)` | 必须双继承 |
-| 窗口模式 | `overrideredirect(False)` | 保留 Windows 原生标题栏（最小化/最大化/关闭） |
-| 置顶 | `attributes("-topmost", True)` | 默认置顶，通过 📌 按钮切换 |
-| 窗口尺寸 | `360x580`，min `320x420`，max `480x800` | |
+> **唯一规范。** 本文档是 `src/aitool_desktop/app.py` 当前界面实现和后续 UI 修改的唯一设计依据。修改界面前必须阅读“修改前检查清单”，完成后必须执行“验收清单”。本文档区分“当前实现”和“未来可选”，不把未实现的能力写成产品承诺。
 
 ---
 
-## 2. 颜色体系（THEME）
+## 1. 产品定位
 
-```python
-THEME = {
-    "bg":        "#1a1b2e",   # 主背景
-    "surface":   "#232438",   # 中转站/状态栏背景
-    "elevated":  "#2a2b42",   # Toast / 弹出菜单背景
-    "hover":     "#313349",   # 按钮 hover
-    "card":      "#262840",   # 卡片背景（中转站条目 + 动作卡片）
-    "border":    "#353755",   # 卡片边框
-    "text":      "#f0f1f8",   # 主文字（高亮度）
-    "text_sec":  "#b8bbd8",   # 次要文字（标题栏、状态栏）
-    "text_muted":"#8a8db0",   # 辅助文字（描述、提示）
-    "primary":   "#7c6ef0",   # 主按钮
-    "primary_hover":"#8b7ff5",
-    "danger":    "#e85a5a",   # 删除按钮
-    "success":   "#4ade80",   # 状态就绪
-    "warning":   "#fbbf24",   # 状态执行中
-}
-```
+AiTool 是一个 **Windows 文件抽屉 / 文件中转站**：用户把文件、文件夹、网址或脚本临时放进一个窄小、常驻、可置顶的工作入口，再快速打开、拖出、复制或执行动作。
 
-### 亮度原则
-- **小字（≤11pt）必须用高亮度颜色**：`text_sec` 或 `text`，**禁止用 `text_muted` 显示需要阅读的文字**
-- `text_muted` 仅用于：描述行、提示语、空状态文字
-- 早期 `text_sec=#9295b0` / `text_muted=#5d6080` 太暗，中文小字糊成一片，已提亮
+它不是普通的大面板、仪表盘或内容管理后台。设计必须优先保证：
+
+- 窄窗口中信息一眼可扫完，常用动作离手近；
+- 文件拖入、拖出和 `Ctrl+V` 比复杂导航更重要；
+- 中转站和快捷动作是两个清楚分开的工作区域；
+- UI 不应为了“填满空间”而增加装饰、层级或长期驻留的信息；
+- Windows 原生窗口行为（标题栏、任务栏、资源管理器、托盘）是体验的一部分。
+
+### 当前实现 vs 未来可选
+
+| 范围 | 当前实现 | 未来可选（未实现，不得在当前 UI 中暗示已存在） |
+|---|---|---|
+| 产品形态 | 窄窗口文件中转站 + 快捷动作卡片 | 更丰富的工作区、筛选或搜索 |
+| 排序 | 存储层支持 `default` / `custom` 和 `custom_order`；当前主界面没有排序/手动重排控件 | 可见的排序菜单、拖动排序、排序说明 |
+| 主题 | 暗色默认，支持亮色、暗色、system 环境变量和标题栏即时切换 | 跟随系统变化的实时监听、主题持久化设置 |
+| 访问能力 | 原生标题栏、`Ctrl+V`、`Alt+A`、拖放、双击、右键 | 完整键盘导航、控件语义标签、屏幕阅读器专门适配 |
 
 ---
 
-## 3. 字体规范
+## 2. 框架、窗口与持久化
 
-```python
-FONT = "Microsoft YaHei UI"     # 全局 UI 字体
-FONT_MONO = "Consolas"          # 参数编辑框等宽字体
-```
+| 项目 | 当前契约 |
+|---|---|
+| GUI | `CustomTkinter` + `tkinterdnd2` |
+| 根类 | `DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper)`，必须保留双继承 |
+| 标题栏 | `overrideredirect(False)`，保留 Windows 原生标题栏 |
+| 置顶 | 启动时置顶；标题栏中的 📌 / 📍 控件切换 `-topmost` |
+| 首次启动默认尺寸 | **360 × 580** |
+| 最小尺寸 | **320 × 420**（按当前显示器可用区域进一步取较小值） |
+| 已保存尺寸 | 使用 `window_geometry.py` 的 schema v1；有效保存值优先恢复，缺失或无效值使用默认尺寸并按显示器边界放置 |
+| 最大尺寸 | 当前没有 `maxsize(480, 800)` 约束；geometry 纯逻辑层有 `MAX_WINDOW_DIMENSION=10000` 校验，放置时受显示器可用区域限制 |
 
-### 字号阶梯
-
-| 用途 | 字号 | weight |
-|------|------|--------|
-| 窗口标题（已移除） | — | — |
-| 区域标题（中转站/快捷动作） | 11pt | bold |
-| 中转站条目名称 | 12pt | normal |
-| 中转站条目图标 | 16pt | — |
-| 动作卡片标题 | 10pt | bold |
-| 动作卡片描述 | 8pt | normal |
-| 动作卡片图标 | 18pt | — |
-| 提示文字（拖入收藏…） | 10pt | normal |
-| 状态栏文字 | 11pt | normal |
-| Toast 消息 | 12pt | normal |
-| 对话框标签 | 12pt | normal |
-| 对话框输入框 | 12pt | normal |
-| 对话框按钮 | 12pt | normal |
-| 对话框参数编辑 | 11pt mono | normal |
-
-### 字体使用规则
-- **所有 CTk 控件**：必须用 `ctk.CTkFont(family=FONT, size=N)`
-- **所有原生 tk.Label**：必须用 `font=(FONT, N)` 或 `font=(FONT, N, "bold")`
-- **禁止裸用 `ctk.CTkFont(size=N)` 不带 family**：会回退到默认字体，中文显示不一致
+默认尺寸必须保持窄窗口特征。任何新增标题、筛选器或工具条都必须先证明不会把窗口推向“大面板”。不得通过修改 geometry schema 或清理保存文件来强制用户回到默认尺寸。
 
 ---
 
-## 4. 布局结构
+## 3. 主窗口布局层级
 
-### 4.1 主窗口 Grid
+当前真实层级如下，后续修改不得用旧版的 `row=0/1/2` 描述替换它：
 
-```
-row=0: 中转站区域（含标题栏 + 置顶按钮 + 条目列表）
-row=1: 快捷动作区域（含标题栏 + 加号按钮 + 卡片滚动列表）  ← weight=1 可伸缩
-row=2: 状态栏
-```
-
-### 4.2 中转站区域
-
-```
-┌─────────────────────────────────────┐
-│ 中转站          拖入收藏·拖出复制  📌│  ← header（CTkFrame transparent）
-├─────────────────────────────────────┤
-│ ┌─────────────────────────────────┐ │
-│ │ 📁  文件夹名称              ✕  │ │  ← 条目卡片
-│ │ 📄  文件名称                ✕  │ │
-│ └─────────────────────────────────┘ │
-└─────────────────────────────────────┘
+```text
+root: DesktopToolApp
+├─ row=0, weight=1: content                  # 可伸缩主体
+│  ├─ row=0: station_section                 # 固定高度约 188px
+│  │  ├─ header                              # 中转站标题、主题切换、置顶
+│  │  └─ station_scroll                      # 独立 Canvas + Scrollbar
+│  │     └─ _station_item_host               # 中转站动态条目
+│  └─ row=1, weight=1: actions_scroll         # 独立动作滚动区
+│     └─ _actions_canvas + actions_scrollbar
+│        └─ _action_item_host                # 动作标题、卡片、底部提示
+└─ row=1, weight=0: statusbar                 # 固定在窗口底部
 ```
 
-### 4.3 快捷动作区域
+关键规则：
 
-```
-┌─────────────────────────────────────┐
-│ 快捷动作                        ➕  │  ← header（CTkFrame transparent）
-├─────────────────────────────────────┤
-│ ┌─────────────────────────────────┐ │
-│ │ 📋  文件夹覆盖复制         ›  │ │  ← 动作卡片
-│ │     全量覆盖目标目录           │ │
-│ │ ⚡  启动脚本               ›  │ │
-│ │     运行.bat/.cmd脚本          │ │
-│ │ 🔄  SVN 更新              ›  │ │
-│ │     svn update工作副本         │ │
-│ └─────────────────────────────────┘ │
-│               ↕ 可滚动               │
-└─────────────────────────────────────┘
-```
+1. `root` 直接拥有 `content` 和 `statusbar`。
+2. `content` 内直接拥有 `station_section` 和 `actions_scroll`。
+3. `statusbar` 不属于任何滚动 Canvas，始终固定可见。
+4. 中转站和动作区使用两个独立的 `tk.Canvas` + `ctk.CTkScrollbar`，滚动位置互不影响。
+5. `station_section` 的标题区不随中转站条目滚动；动作标题属于动作 Canvas 内容，会随动作区滚动。
+6. 刷新中转站只能清理 `_station_item_host`；刷新动作只能清理 `_action_item_host`。不得销毁 `content`、`statusbar`、Canvas 或 Scrollbar。
+7. 主题刷新可以重绘控件颜色和动态条目，但必须保留上述层级与两个滚动区的独立性，并尽量恢复切换前的滚动位置。
+
+### 当前不允许的结构变化
+
+- 不得把两个区域合并成一个滚动面板；
+- 不得让状态栏进入 Canvas；顶部收起横条可以覆盖固定状态栏，但不得改变 root 直接拥有 `content` 和 `statusbar` 的层级；
+- 不得改用 `CTkScrollableFrame`。当前拖放依赖直接注册到 Canvas 和动态子控件，`CTkScrollableFrame` 会引入不可控的拖放拦截；
+- 不得使用 `winfo_children()[n]` 作为布局或刷新契约；
+- 不得为了新增控件移动中转站/动作区的滚动宿主。
 
 ---
 
-## 5. 卡片行对齐规范（最重要的规则！）
+## 4. 主题与颜色 token
 
-### 5.1 图标列固定宽度
+### 4.1 唯一来源
 
-中转站条目和动作卡片的图标列**必须用 `grid_columnconfigure(0, minsize=42, weight=0)`** 固定为 42px。
+所有主题颜色必须来自 `src/aitool_desktop/theme.py` 的 token 字典，并通过 `self._t("token_name")` 使用。主题切换必须同时更新 CustomTkinter 和原生 Tk 控件；不能只调用 `ctk.set_appearance_mode()` 后留下旧色的原生 Label、Canvas 或图标背景。
 
-```python
-# ✅ 正确
-item.grid_columnconfigure(0, minsize=42, weight=0)
-item.grid_columnconfigure(1, weight=1)
-icon_label.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+当前启动规则：
 
-# ❌ 错误——用 width / padx 自适应，emoji 宽度不同会导致名称错位
-icon_label = tk.Label(frame, text="⚡", width=3, ...)  # ⚡ 比 📋 窄，错位
-icon_label = tk.Label(frame, text="⚡", padx=6, ...)   # 同上
-```
+- 没有 `AITOOL_THEME` 时，启动模式为 **`dark`**；
+- `AITOOL_THEME=light`、`dark`、`system` 时保留显式覆盖；非法值按 app 的 dark 默认回退；
+- `system` 在 Windows 上读取系统偏好，无法读取时使用 dark；
+- 标题栏主题按钮在 dark 与 light 间即时切换。用户点击后变为显式的另一种主题，不改变 `system` 解析函数的兼容性。
 
-### 5.2 为什么不能用 width / padx
+### 4.2 token 语义
 
-| emoji | Unicode 宽度 | tk.Label 自适应后 |
-|-------|-------------|-------------------|
-| 📋 | 双字节 | 列宽约 30px |
-| 🔄 | 双字节 | 列宽约 30px |
-| ⚡ | 单字节 | 列宽约 22px ← **偏窄，名称左移** |
+| token | 当前语义 | 暗色当前值 | 亮色当前值 |
+|---|---|---:|---:|
+| `window` | 窗口底色 | `#1a1b2e` | `#f5f7fb` |
+| `background` | 主背景、动作区 | `#1a1b2e` | `#f5f7fb` |
+| `surface` | 中转站、状态栏、输入表面 | `#232438` | `#ffffff` |
+| `elevated` | `_toast` 现行 Toast、较高层表面 | `#2a2b42` | `#ffffff` |
+| `card` | 动作卡片 | `#262840` | `#ffffff` |
+| `text` | 主文字 | `#f0f1f8` | `#182033` |
+| `secondary` | 区域标题、状态文字、次要可读文字 | `#b8bbd8` | `#4d5870` |
+| `muted` | 描述、提示、空状态、失效路径 | `#8a8db0` | `#778198` |
+| `border` | 卡片边框、输入边框 | `#353755` | `#d5dbe7` |
+| `hover` | 悬停表面 | `#313349` | `#e9edf5` |
+| `pressed` | 按下/滚动条悬停表面 | `#3b3d57` | `#dfe4ef` |
+| `focus` | 强调、焦点、主题强调 | `#8b7ff5` | `#6558d3` |
+| `primary` | 主按钮、进度条 | `#7c6ef0` | `#6558d3` |
+| `danger` | 删除、失败 | `#e85a5a` | `#cf3f4e` |
+| `success` | 就绪、成功 | `#4ade80` | `#21864b` |
+| `warning` | 执行中、拖入提示 | `#fbbf24` | `#a56b00` |
+| `disabled_foreground` | 禁用文本 | `#666a87` | `#a2a9b8` |
+| `disabled_background` | 禁用文本框背景 | `#303248` | `#e6e9f0` |
+| `entry` / `textbox` | 输入控件 | `#232438` | `#ffffff` |
+| `canvas` | 两个原生 Canvas | `#1a1b2e` | `#f5f7fb` |
+| `scrollbar` | 滚动条按钮 | `#4b4e6c` | `#c3cada` |
+| `progress` | 进度条 | `#7c6ef0` | `#6558d3` |
+| `toast` | 预留的 Toast 主题表面；当前现行 Toast 未使用 | `#2a2b42` | `#182033` |
+| `action_icon` | 未知动作图标回退色 | `#7c6ef0` | `#6558d3` |
 
-用 `minsize=42` + `sticky="nsew"` 让图标在固定格子里居中，**与 emoji 宽度无关**。
+动作类型颜色使用 `action_icon_by_kind`，不要把颜色硬编码到卡片构造函数。Glyph（emoji）属于 `ACTION_ICON_GLYPHS`，不是颜色 token。
 
-### 5.3 图标垂直位置
+### 4.3 可读性规则
 
-```python
-icon_label.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-```
-
-- `sticky="nsew"`：图标在格子内拉伸居中
-- `pady=(0, 8)`：上边距 0，下边距 8，视觉上图标偏上一点（emoji 基线偏低，需要补偿）
-
-### 5.4 名称列对齐
-
-中转站和动作卡片的名称列 grid 参数**必须一致**：
-
-```python
-# 两处都是
-body.grid(row=0, column=1, sticky="ew", padx=2, pady=4)
-```
-
----
-
-## 6. 控件选择规范
-
-### 6.1 什么时候用原生 `tk.Label` vs `ctk.CTkLabel`
-
-| 场景 | 控件 | 原因 |
-|------|------|------|
-| 中转站图标 | `tk.Label` | 需要拖出（`drag_source_register`），CTkLabel 不触发 `<<DragInitCmd>>` |
-| 中转站名称 | `tk.Label` | 同上 |
-| 动作卡片图标 | `tk.Label` | 需要彩色 emoji，CTkLabel 的 Canvas 渲染会丢失颜色 |
-| 动作卡片标题/描述 | `tk.Label` | 与中转站对齐（CTkLabel 有内部 padding，会导致缩进不一致） |
-| 区域标题 | `ctk.CTkLabel` | 无拖放需求，样式方便 |
-| 状态栏 | `ctk.CTkLabel` | 同上 |
-| 空状态提示 | `ctk.CTkLabel` | 同上 |
-
-### 6.2 tk.Label 的背景色
-
-原生 `tk.Label` **必须手动设 `bg=THEME["card"]`**，否则是系统默认灰色。
-
-```python
-# ✅ 正确
-tk.Label(frame, text="...", bg=THEME["card"], fg=THEME["text"], font=(FONT, 12))
-
-# ❌ 错误——忘记 bg，灰底破坏卡片一致性
-tk.Label(frame, text="...", fg=THEME["text"], font=(FONT, 12))
-```
+- 需要阅读的小字优先使用 `secondary`；`muted` 只用于描述、提示、空状态和失效信息；
+- 禁止把一整段可操作说明放在低对比度 `muted` 上；
+- 原生 `tk.Label`、原生 Canvas、禁用 `CTkTextbox` 都必须显式使用当前 token；
+- 暗色和亮色都必须检查文字、图标、边框、悬停表面之间的对比度；
+- 不以“CustomTkinter 自动换色”作为完整主题刷新证据。
 
 ---
 
-## 7. 按钮规范
-
-### 7.1 统一按钮尺寸
-
-所有小图标按钮**必须**用相同尺寸：
+## 5. 字体与字号
 
 ```python
-width=24, height=24, corner_radius=6
+FONT = "Microsoft YaHei UI"
+FONT_MONO = "Consolas"
 ```
 
-| 按钮 | 位置 | text | fg_color | font |
-|------|------|------|----------|------|
-| 📌 置顶 | 中转站标题栏 | "📌"/"📍" | hover | FONT 13pt |
-| ➕ 添加 | 快捷动作标题栏 | "➕" | primary | FONT 13pt |
-| ✕ 移除 | 中转站条目 | "✕" | transparent | FONT 11pt |
-| › 编辑 | 动作卡片 | "›" | transparent | FONT 20pt |
+当前 `FS` 阶梯：
 
-### 7.2 CTkButton 禁忌
+| 用途 | 当前字号 |
+|---|---:|
+| 区域标题 | 12 |
+| 动作卡片标题 | 11 |
+| 动作卡片描述 | 9 |
+| 中转站条目名称 | 11 |
+| 状态栏文字 | 11 |
+| Toast | 12 |
+| 对话框常规文字 | 12 |
+| 中转站 fallback 文件图标 | 14 |
+| 动作卡片图标 | 18 |
+| 参数编辑等宽文字 | `FONT_MONO`，按对话框实际配置 |
 
-```python
-# ❌ 禁止使用以下参数（CTkButton 不支持，会崩溃）
-ctk.CTkButton(..., padx=0, pady=0)      # 崩溃！
-ctk.CTkButton(..., anchor="center")     # 可能导致按钮变高
+字体规则：
 
-# ✅ 居中文字用默认行为即可，CTkButton 默认居中
-ctk.CTkButton(..., text="➕", width=24, height=24)
-```
-
-### 7.3 emoji 按钮 vs 文字按钮
-
-- 小尺寸按钮（24x24）用 emoji：`📌 ➕ ✕ ›`
-- **禁止用全角字符** `＋`：显示太小且偏
-- **禁止用半角 `+` + 大字号**：会撑高按钮
+- `ctk.*` 控件使用 `ctk.CTkFont(family=FONT, size=...)`；
+- 原生 `tk.Label` 使用 `(FONT, size)`，需要强调时加 `"bold"`；
+- 编辑卡片的方向箭头和需要等宽对齐的参数使用 `FONT_MONO`；
+- 不得裸用没有 `family` 的 `CTkFont`；
+- 新增文字必须先判断是可读信息、辅助提示还是装饰，不能仅按“越小越轻”处理。
 
 ---
 
-## 8. 图标规范
+## 6. 中转站、动作卡片与图标
 
-### 8.1 动作类型图标映射
+### 6.1 中转站条目
 
-```python
-ACTION_ICON_TEXT = {
-    "folder-copy": "📋",
-    "launch-bat": "⚡",
-    "update-svn": "🔄",
-}
+- 背景属于 `surface`；普通条目使用透明容器，悬停时使用 `hover`；
+- 图标列使用当前 `SPACING["icon_col"] = 52`，不是旧文档中的 42；
+- 名称列使用可伸缩列，失效路径追加“（失效）”并使用 `muted`；
+- 删除列固定预留，避免删除按钮出现/消失造成横向抖动；
+- 原生 `tk.Label` 用于图标和名称，因为它们还承担拖出源；
+- 文件图标优先取 Windows Shell 图标，失败时使用按扩展名映射的 emoji；
+- 中转站标题栏包含“中转站”、拖放提示、主题按钮和置顶按钮。
 
-ACTION_ICON_COLORS = {
-    "folder-copy": "#60a5fa",   # 蓝
-    "launch-bat": "#fbbf24",    # 黄
-    "update-svn": "#4ade80",    # 绿
-}
-```
+### 6.2 动作卡片
 
-### 8.2 图标渲染
+- 动作内容位于 `_action_item_host`，标题行有“快捷动作”和 `➕` 添加按钮；
+- 卡片背景使用 `card`，边框使用 `border`，当前圆角为 10；
+- 动作图标列使用 `SPACING["icon_col"] = 52`，动作图标为彩色原生 `tk.Label`；
+- 动作类型包括：文件夹覆盖复制、启动脚本、SVN 更新、SVN 提交、打开网页、打开应用；
+- 卡片点击执行动作；右侧 `>` 按钮进入编辑；
+- 文件夹覆盖复制执行前有确认，并显示带进度条的 HUD；其他动作完成后通过 Toast 和状态栏反馈；
+- 卡片底部保留“✨ 一切都可以拖进来！”提示，并可点击打开使用说明。
 
-必须用 `tk.Label` + `fg=color` 渲染彩色 emoji：
+### 6.3 按钮尺寸：以当前实现为准
 
-```python
-icon_label = tk.Label(frame, text=icon_text,
-                      bg=THEME["card"], fg=icon_color,
-                      font=(FONT, 18))
-```
+| 控件 | 当前尺寸 | 当前表面 |
+|---|---|---|
+| 主题切换 | 52 × 24，圆角 12 | `hover` / `elevated` |
+| 置顶 📌 / 📍 | 24 × 24，圆角 12 | `hover` / `elevated` |
+| 添加 ➕ | 24 × 24，圆角 12 | `primary` / `focus` |
+| 中转站删除 ✕ | 22 × 22，圆角 11 | 透明，悬停 `danger` |
+| 卡片编辑 `>` | 24 × 24，圆角 12 | 透明，悬停 `hover` |
 
----
+不要把“所有按钮必须 24×24、圆角 6”作为规范；那与当前实现不符。新增按钮应选择与所在层级一致的尺寸，并保留足够的可点击面积。
 
-## 9. 滚动区域规范
+### 6.4 控件选择禁忌
 
-### 9.1 禁止用 CTkScrollableFrame
-
-`CTkScrollableFrame` 内部 Canvas 会拦截拖放事件，导致文件拖入失效。
-
-### 9.2 正确做法：普通 Frame + Canvas + Scrollbar
-
-```python
-self._card_canvas = tk.Canvas(self.card_scroll, bg=THEME["bg"],
-                              highlightthickness=0, bd=0)
-scrollbar = ctk.CTkScrollbar(self.card_scroll, command=self._card_canvas.yview)
-self._card_inner = ctk.CTkFrame(self._card_canvas, fg_color=THEME["bg"])
-self._card_window = self._card_canvas.create_window((0, 0),
-                            window=self._card_inner, anchor="nw")
-self._card_canvas.configure(yscrollcommand=scrollbar.set)
-```
+- 需要拖出的中转站图标和名称必须保持原生 `tk.Label`；
+- 不要用 `CTkScrollableFrame` 代替当前 Canvas 结构；
+- `CTkButton` 不添加不支持的 `padx` / `pady` 参数；
+- 不要用按钮宽度或 emoji 自身宽度来对齐名称，统一使用 grid 列；
+- 原生 Label 必须显式设置 `bg` / `fg`，不能留下系统灰底；
+- 主题相关颜色不新增散落的硬编码值；动作图标颜色除外，也必须放入 token 映射。
 
 ---
 
-## 10. 拖放规范
+## 7. 滚动与拖放契约
 
-### 10.1 拖入（Drop）
+### 7.1 滚动
 
-- 全窗口注册：`self.drop_target_register(DND_FILES)`
-- 全窗口绑定：`self.dnd_bind("<<Drop>>", self._on_global_drop)`
-- 根据鼠标 Y 坐标判断目标区域：
-  - Y < 中转站底部 → 收藏到中转站
-  - Y ≥ 中转站底部 → 创建启动模块
+- 中转站滚轮交给 `_station_canvas`；动作区滚轮交给 `_actions_canvas`；
+- 动态条目及其子控件递归绑定滚轮，鼠标停留在条目内部时仍能滚动对应区域；
+- 两个 Canvas 分别维护 scrollregion 和 yview；
+- 主题切换不能把两个区域合并，也不应将用户滚动位置重置到顶部。
 
-### 10.2 拖出（Drag Out）
+### 7.2 拖入
 
-- 必须绑定到**原生 `tk.Label`**（CTkLabel 不触发 `<<DragInitCmd>>`）
-- 返回值格式：`(COPY, DND_FILES, "{path}")`
-- **路径必须用大括号包裹**：`"{" + entry.path + "}"`
+- 全窗口和稳定容器注册 `DND_FILES`、`DND_TEXT`；动态控件创建后重新递归注册；
+- `<<DragEnter>>` 显示“拖入文件...”，离开恢复“就绪”；注册失败写入 DND diagnostics 并记录日志；
+- 文件、文件夹、网址、脚本可以从窗口任意已注册区域拖入；
+- 拖入与粘贴共用 `_process_input_data`，当前识别顺序为：
+  1. `http://` / `https://` 网页；
+  2. `www.` 网页（自动补 `https://`）；
+  3. 分号分隔且包含至少两个有效目录时生成多路径覆盖复制模块；
+  4. `.url` 生成网页模块；
+  5. `.exe` / `.lnk` 生成打开应用模块；
+  6. `.bat` / `.cmd` / `.py` 生成启动脚本模块；
+  7. 其他有效路径收藏到中转站。
+- 识别成功后保存到对应 storage，并刷新对应区域；当前仅在本次有新增项时显示新增 Toast，纯重复输入不会显示专门的跳过 Toast。跳过项必须有明确 Toast/状态反馈是交互原则和后续修复要求，不是当前实现承诺。
 
-```python
-def _on_station_drag_out(self, entry):
-    from tkinterdnd2 import COPY
-    tcl_path = "{" + entry.path + "}"
-    return (COPY, DND_FILES, tcl_path)
-```
+### 7.3 拖出
 
----
+- 只有中转站原生图标和名称 Label 作为拖出源；
+- 返回 `(COPY, DND_FILES, "{path}")`，路径必须用大括号包裹，以支持 Windows 路径和空格；
+- 拖出不应删除中转站中的原条目。
 
-## 11. 对话框规范
+### 7.4 Ctrl+V
 
-### 11.1 统一样式
-
-```python
-dialog = ctk.CTkToplevel(self)
-dialog.configure(fg_color=THEME["bg"])
-dialog.transient(self)
-dialog.grab_set()
-```
-
-### 11.2 编辑对话框必须包含
-
-- 名称输入框
-- 参数编辑区
-- **删除按钮**（红色 danger，带确认弹窗）
-- 保存按钮（primary 紫色）
-- 快捷动作额外有：校验按钮、执行按钮
-
-### 11.3 字体
-
-对话框内所有控件必须用 `ctk.CTkFont(family=FONT, size=12)`，参数编辑框用 `FONT_MONO`。
+- 使用 `self.bind_all("<Control-v>", self._on_paste)`，确保焦点位于窗口内任意控件时都能响应；
+- 剪贴板内容走与拖入相同的识别逻辑；
+- 空剪贴板或读取失败时静默返回，不弹出无意义错误。
 
 ---
 
-## 12. 常见错误清单
+## 8. 中转站操作、排序与动作操作
 
-| 错误 | 症状 | 解决 |
-|------|------|------|
-| 用 CTkLabel 做拖出源 | `<<DragInitCmd>>` 不触发 | 改用 tk.Label |
-| 拖出返回值无大括号 | 回调触发但文件不出现 | `"{path}"` 包裹 |
-| 图标用 width=N | 不同 emoji 对齐错位 | `minsize=42` + `sticky="nsew"` |
-| 用 CTkScrollableFrame | 拖放事件被拦截 | 普通 Frame + Canvas |
-| CTkButton 加 padx/pady | 程序崩溃 | 去掉，CTkButton 不支持 |
-| 小字用 text_muted | 中文看不清 | 用 text_sec 或提亮 muted |
-| 全角 ＋ 做按钮 | 显示太小 | 用 emoji ➕ |
-| tk.Label 忘记 bg | 灰底破坏一致性 | `bg=THEME["card"]` |
-| 字体不传 family | 中英文混排不一致 | 所有地方带 `family=FONT` |
-| overrideredirect(True) | 无 Windows 标题栏 | 保持 `False` |
+### 8.1 当前中转站操作
+
+| 操作 | 当前行为 |
+|---|---|
+| 双击条目 | 打开存在的文件/文件夹；不存在时显示失效警告 |
+| 右键条目 | 在资源管理器打开所在目录并尽量选中该文件；路径完全失效时显示警告 |
+| 悬停条目 | 显示 hover，并在状态栏显示完整路径 |
+| ✕ 删除 | 从中转站移除、同步保存顺序状态、刷新列表并显示“已移除” Toast；当前不额外弹确认框 |
+| 拖入重复路径 | 由路径身份键去重；仅当本次有新增项时显示新增 Toast，纯重复输入不显示专门的跳过 Toast |
+| 排序 | 默认模式按文件夹优先、名称不区分大小写、路径稳定排序 |
+
+### 8.2 排序边界
+
+存储和纯逻辑层已经支持：
+
+- `sort_mode`: `default` 或 `custom`；
+- `custom_order`: 稳定的规范化路径键；
+- 删除后移除顺序键，再次添加同一路径时可自然追加到末尾；
+- v1 旧数据升级时不凭输入顺序伪造 custom order。
+
+但当前 `app.py` 没有面向用户的排序菜单、重排拖柄或“切换自定义顺序”按钮。后续若实现这些能力，必须先更新本文档的“当前实现”，并明确保存/恢复、键盘和拖放冲突策略。不得把拖出文件或拖入收藏描述成排序操作。
+
+### 8.3 动作卡片操作
+
+- 点击卡片执行；文件夹覆盖复制先确认；
+- 右侧 `>` 打开编辑；
+- 快捷动作和自定义模块的编辑对话框允许修改名称/参数，并提供删除、保存、执行或校验（按当前对话框类型）；
+- `➕` 打开添加菜单/模块配置；新模块保存后刷新动作区并显示 Toast；
+- 执行结果必须通过状态栏、Toast 或成功/失败对话框让用户知道结果，不能只在后台线程完成。
 
 ---
 
-## 13. 修改检查清单
+## 9. 窗口、托盘、置顶与快捷键
 
-改完 UI 后逐项检查：
+### 当前实现
 
-- [ ] 中转站和动作卡片的图标列宽度都是 `minsize=42`
-- [ ] 中转站和动作卡片的名称起始 X 坐标对齐
-- [ ] 所有 `tk.Label` 都设了 `bg=THEME["card"]`
-- [ ] 所有字体都带 `family=FONT`
-- [ ] 所有小图标按钮都是 `24x24, corner_radius=6`
-- [ ] 程序能正常启动（`python -c "from src.aitool_desktop.app import main"`)
-- [ ] 拖入文件到中转站正常
-- [ ] 拖入文件到动作区正常
-- [ ] 拖出文件到资源管理器正常
-- [ ] 编辑对话框有删除按钮
+- 关闭原生窗口按钮不会直接退出，而是保存 geometry 后最小化到系统托盘；
+- 托盘菜单包含打开 AiTool、设置中心、开机自启动切换、彻底退出；
+- 从托盘恢复时重新显示、恢复置顶状态并聚焦窗口；如果进入托盘前已停靠，则先恢复展开 geometry，再重新安排顶部收起；
+- 置顶默认开启，点击 📌 / 📍 后即时调用 `attributes("-topmost", ...)`，并通过 Toast 反馈；
+- Windows 全局 `Alt+A` 的行为按窗口状态区分：托盘隐藏时恢复并展开，顶部收起或收起动画中展开，正常可见时进入托盘；
+- 窗口移动到当前显示器工作区顶部约 12px 内并稳定约 240ms 后停靠；停靠展开状态在鼠标离开窗口约 1000ms 后通过 `after()` 向上收起，只露出约 30px 的根级横条；
+- 收起横条使用 `surface`、`border`、`secondary` 等主题 token，文案为“移入展开 · 拖动可移动”；鼠标进入后向下展开，横条支持 `Enter` / `Leave` / `ButtonPress-1` / `B1-Motion` / `ButtonRelease-1`；
+- 横条水平拖动可移动窗口，向下拖出顶部后解除停靠；停靠状态与 📌 / 📍 控制的 `-topmost` 置顶状态相互独立；
+- 收起、展开和反向动作只用可取消的 `after()` y 轴动画；geometry 保存使用展开 geometry，绝不写入收起期间的负 y；启动 geometry restore 阶段不会误触发停靠或收起；
+- 收起横条显式注册 `DND_FILES` / `DND_TEXT`，拖到横条仍调用现有 `_on_global_drop()` / `_process_input_data()`；中转站图标和名称的现有拖出源保持不变；
+- 设置、编辑、确认、文件选择和执行 HUD 等模态或重要操作期间暂停自动收起；
+- 设置中心当前提供开机自启动开关和 Alt+A 说明；它不是主题设置页。
+
+### 修改限制
+
+- 不得把“关闭”改成无提示的强制退出；彻底退出必须仍走托盘退出路径并保存 geometry；
+- 不得用自绘无边框窗口替代原生标题栏；
+- 不得新增与 `Alt+A`、`Ctrl+V` 冲突的全局快捷键；
+- 托盘线程不得直接操作 Tk，必须通过 `after(0, ...)` 回到 Tk 主线程。
+
+---
+
+## 10. 主题切换交互
+
+- 主题按钮必须放在稳定的中转站标题栏，不得放进任一滚动 Canvas；
+- 按钮文案表示“点击后将切换到的主题”：暗色时显示 `☀ 亮色`，亮色时显示 `☾ 暗色`；
+- 点击后立即更新 token、CustomTkinter 外观、原生 Tk Label、Canvas、滚动条、状态栏、按钮和动态卡片；
+- 状态栏显示“已切换至亮色主题”或“已切换至暗色主题”；
+- 切换不改变 entries、modules、geometry、置顶状态、托盘状态或滚动宿主；
+- 当前点击只改变本次运行内的有效主题，未实现主题配置持久化；
+- `system` 只作为启动解析模式保留。不要将主题按钮实现为“重新启动应用”或只改配置文件。
+
+---
+
+## 11. 状态反馈与可见性
+
+### 状态栏
+
+状态栏固定在窗口底部，由状态圆点和文字组成；顶部收起时，固定状态栏暂时由根级窄横条覆盖，展开后恢复状态圆点和文字。当前状态级别：
+
+- `ready`：就绪、成功完成，使用 `success`；
+- `warning`：拖入、粘贴、执行中，使用 `warning`；
+- `blocked`：被拒绝或危险结果，使用 `danger`；
+- `muted`：路径预览或辅助信息，使用 `muted`。
+
+### Toast 与对话框
+
+- `_toast` 使用 `elevated` 表面，默认约 3 秒后消失；
+- 成功/失败的短反馈优先 Toast；
+- 需要确认的动作使用确认对话框；
+- 路径不存在、执行失败等需要用户决策的信息使用警告/错误对话框；
+- 长时间复制使用 HUD + 不确定进度条，不能让用户猜测程序是否卡死；
+- 反馈文字要说明发生了什么，不能只显示颜色或图标。
+
+### 可访问性与可见性
+
+- 不用颜色作为唯一状态信号：状态点必须配文字，主题按钮必须配“亮色/暗色”文字；
+- 文字和按钮使用当前 token，亮暗主题都必须保持可读对比度；
+- 悬停删除按钮虽然默认弱化，但必须保留固定布局列，避免位置跳动；
+- 运行期间，失效路径保留在已加载列表中并明确标记“失效”；但 `storage.py::_load_entries` 在重启加载时会过滤 `not path.exists()`，因此失效路径不会跨重启保留。未来改进/设计原则是保留失效项并明确标记，不能静默消失；
+- 当前实现提供鼠标、拖放、`Ctrl+V`、`Alt+A` 和双击路径；完整键盘焦点顺序和屏幕阅读器语义仍是未来可选能力，不得宣称已经完成；
+- 新增图标按钮至少要有可理解的文字、状态反馈或 tooltip 方案，不能只放无语义装饰。
+
+---
+
+## 12. 禁止事项
+
+1. 不得把 AiTool 改造成宽大的普通管理面板。
+2. 不得恢复旧版错误布局描述：状态栏不是 `row=2`，它是 root 的 `row=1`；中转站和动作区不是同一个滚动区。
+3. 不得绕过 `theme.py` token 体系新增主题颜色。
+4. 不得只修改配置或调用全局外观函数而不刷新当前界面。
+5. 不得默认从 `system` 启动；当前无环境变量默认必须是 dark。
+6. 不得移除或破坏 `AITOOL_THEME=light|dark|system` 覆盖。
+7. 不得修改 geometry schema、删除有效用户 geometry 或把用户保存尺寸强行替换成默认尺寸。
+8. 不得让动态刷新销毁固定滚动宿主、状态栏或 root 布局。
+9. 不得用 `CTkScrollableFrame`、隐式子控件顺序或 `winfo_children()[n]`。
+10. 不得用原生 Label 的系统默认灰底；不得遗漏字体 family。
+11. 不得让拖出源改为无法可靠触发 `<<DragInitCmd>>` 的控件。
+12. 不得把尚未实现的搜索、手动排序、主题持久化、实时系统监听或完整键盘导航写成当前能力。
+13. 本任务以外不得修改打包 spec、dist/build/evidence、state 文件或无关功能文件。
+
+---
+
+## 13. 修改前检查清单
+
+- [ ] 已阅读本文档并确认修改属于 AiTool 文件抽屉/中转站场景，而不是普通大面板。
+- [ ] 已核对 `app.py` 当前 root → content/statusbar → station/actions 层级。
+- [ ] 已确认新增控件不会进入错误的 Canvas 或破坏独立滚动。
+- [ ] 已确认默认窗口仍是 360×580，最小尺寸仍是 320×420。
+- [ ] 已检查 `window_geometry.py` 的 schema 和有效保存 geometry 恢复路径。
+- [ ] 已检查无环境变量主题默认是 dark，显式 light/dark/system 仍可用。
+- [ ] 已确认所有新颜色来自 `theme.py` token；原生 Tk 控件也有亮/暗刷新路径。
+- [ ] 已选择正确字体 family 和字号，并考虑中文可读性。
+- [ ] 已确认拖入、拖出、Ctrl+V、双击、删除、托盘、置顶、Alt+A 和主题切换没有快捷键或事件冲突。
+- [ ] 已区分当前能力和未来可选能力，没有在文案中虚构功能。
+- [ ] 已准备对应的主题、layout/contract、geometry 或交互测试。
+
+---
+
+## 14. 验收清单
+
+### 静态与自动化
+
+- [ ] `python -m pytest tests/test_theme.py tests/test_window_geometry.py tests/test_app_layout.py tests/test_gui_contract.py -q`
+- [ ] 主题测试明确覆盖：无环境变量默认 dark、`light`、`dark`、`system` 显式覆盖。
+- [ ] geometry 测试覆盖默认窄尺寸、schema v1、有效保存值恢复和无效值回退。
+- [ ] layout/contract 测试确认 root/content/statusbar 和两个滚动宿主未被破坏。
+- [ ] `python -m compileall -q src/aitool_desktop`
+- [ ] `git diff --check`
+
+### 可见 UI
+
+- [ ] 首次无 geometry 文件启动为约 360×580 的窄窗口，标题栏为 Windows 原生标题栏。
+- [ ] 中转站和动作区各自滚动，状态栏始终固定可见。
+- [ ] 标题栏中的主题按钮清晰、可点击、不挤压中转站提示和置顶按钮。
+- [ ] 点击主题按钮后亮/暗颜色立即覆盖背景、卡片、原生 Label、Canvas、按钮、滚动条和状态栏。
+- [ ] 切换主题不会清空条目、动作、保存 geometry 或重置两个滚动位置。
+- [ ] 拖入文件/文件夹、网址、`.url`、`.exe`、`.lnk`、`.bat` / `.cmd` / `.py` 得到当前实现对应结果。
+- [ ] 从中转站图标或名称拖出到资源管理器可得到原路径，空格路径不被截断。
+- [ ] `Ctrl+V`、双击打开、右键打开目录、删除按钮均有可理解结果和反馈。
+- [ ] 置顶按钮、关闭到托盘、托盘恢复和 `Alt+A` 工作正常。
+- [ ] 长操作有 HUD/进度反馈，失败和失效路径可见且可理解。
+- [ ] 亮色与暗色下中文小字、按钮文字、状态文字和禁用文本框均清晰可读。
+
+### 交付边界
+
+- [ ] 修改文件仅限本次任务声明的 app、必要主题测试和 `UI_DESIGN_SPEC.md`。
+- [ ] 未修改 spec、dist/build/evidence、state 文件或其他功能文件。
+- [ ] 文档中的“当前实现”与代码、测试结果一致；任何新增未实现能力都放在“未来可选”。

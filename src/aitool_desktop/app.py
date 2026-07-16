@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import weakref
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import ctypes
@@ -29,7 +30,13 @@ from .operations import (
 )
 from .storage import ModuleStorage, StationStorage
 from .station_ordering import normalize_path_key, remove_station_entry
-from .theme import ACTION_ICON_GLYPHS, parse_theme_mode, resolve_theme_mode, theme_tokens
+from .theme import (
+    ACTION_ICON_GLYPHS,
+    parse_theme_mode,
+    resolve_theme_mode,
+    theme_tokens,
+    toggle_theme_mode,
+)
 from .window_geometry import (
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
@@ -43,6 +50,273 @@ from .window_geometry import (
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+GWL_STYLE = -16
+WS_THICKFRAME = 0x00040000
+WS_SIZEBOX = 0x00040000
+WS_MAXIMIZEBOX = 0x00010000
+WS_CAPTION = 0x00C00000
+WS_SYSMENU = 0x00080000
+WS_MINIMIZEBOX = 0x00020000
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+GA_ROOT = 2
+
+# LONG_PTR is a signed pointer-sized value.  Do not use ctypes' default
+# ``c_int`` for Get/SetWindowLongPtrW: that truncates the value on 64-bit
+# Windows and can make a successful-looking style update a no-op.
+_LONG_PTR = ctypes.c_int64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_int32
+_NATIVE_STYLE_MASK = WS_THICKFRAME | WS_SIZEBOX | WS_MAXIMIZEBOX
+
+
+def _resolve_native_window_hwnd(tk_hwnd: int) -> int:
+    """Resolve Tk's client HWND to the visible top-level HWND on Windows.
+
+    On Windows, ``winfo_id()`` for a Tk/CustomTkinter root is not necessarily
+    the HWND which owns the native caption.  CustomTkinter itself resolves
+    this relationship with ``GetParent(self.winfo_id())`` before calling DWM.
+    Applying ``GWL_STYLE`` to the Tk client HWND consequently leaves the
+    visible top-level frame unchanged.  ``GetAncestor(GA_ROOT)`` is the more
+    explicit form and also handles a Tk build with an intermediate parent;
+    the GetParent fallback keeps this compatible with older Windows/Tk builds.
+    """
+
+    candidate = int(tk_hwnd or 0)
+    if os.name != "nt" or not candidate:
+        return candidate
+
+    try:
+        user32 = ctypes.windll.user32
+
+        get_ancestor = getattr(user32, "GetAncestor", None)
+        if get_ancestor is not None:
+            get_ancestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            get_ancestor.restype = wintypes.HWND
+            root_hwnd = get_ancestor(wintypes.HWND(candidate), GA_ROOT)
+            root_hwnd = int(getattr(root_hwnd, "value", root_hwnd) or 0)
+            if root_hwnd:
+                logger.debug(
+                    "resolved Tk HWND %#x to visible root HWND %#x via GetAncestor",
+                    candidate,
+                    root_hwnd,
+                )
+                return root_hwnd
+
+        get_parent = getattr(user32, "GetParent", None)
+        if get_parent is not None:
+            get_parent.argtypes = [wintypes.HWND]
+            get_parent.restype = wintypes.HWND
+            parent_hwnd = get_parent(wintypes.HWND(candidate))
+            parent_hwnd = int(getattr(parent_hwnd, "value", parent_hwnd) or 0)
+            if parent_hwnd:
+                logger.debug(
+                    "resolved Tk HWND %#x to visible parent HWND %#x via GetParent",
+                    candidate,
+                    parent_hwnd,
+                )
+                return parent_hwnd
+    except Exception as exc:
+        logger.debug(
+            "native root HWND resolution failed for Tk HWND %#x: %s",
+            candidate,
+            exc,
+        )
+
+    # If the relationship cannot be queried, retain the original handle so
+    # the verified API path can still be used by non-Windows/headless tests.
+    logger.debug("using Tk HWND %#x as native style target", candidate)
+    return candidate
+
+
+def _set_native_window_position(hwnd: int, x: int, y: int) -> bool:
+    """Move a visible top-level HWND to an absolute screen position.
+
+    Tk interprets a negative geometry coordinate as an offset from the right
+    or bottom of the screen.  The drawer's collapsed position is instead a
+    negative *absolute* screen coordinate, so that case must bypass Tk's
+    geometry parser.  Keep this helper position-only: in particular, do not
+    change the native frame styles or the window size while docking.
+    """
+
+    if os.name != "nt" or not hwnd:
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        set_window_pos = user32.SetWindowPos
+        set_window_pos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        set_window_pos.restype = wintypes.BOOL
+
+        native_hwnd_value = _resolve_native_window_hwnd(int(hwnd))
+        if not native_hwnd_value:
+            logger.warning("no visible native HWND resolved for position update")
+            return False
+
+        result = set_window_pos(
+            wintypes.HWND(native_hwnd_value),
+            wintypes.HWND(0),
+            int(x),
+            int(y),
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        succeeded = bool(result)
+        if not succeeded:
+            logger.warning(
+                "SetWindowPos failed for visible HWND %#x at (%d, %d)",
+                native_hwnd_value,
+                x,
+                y,
+            )
+        return succeeded
+    except Exception as exc:
+        logger.debug("native window position update skipped: %s", exc)
+        return False
+
+
+def _disable_native_resize_and_maximize(hwnd: int) -> bool:
+    """Keep the native title bar while removing Win32 resize/Snap affordances.
+
+    This is deliberately a verified operation.  ``SetWindowLongPtrW`` can
+    return a value that only describes the previous style, while
+    ``SetWindowPos`` only refreshes the non-client frame.  Both calls and a
+    second ``GetWindowLongPtrW`` are therefore required before returning true.
+    """
+
+    if os.name != "nt" or not hwnd:
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        get_window_long_ptr = user32.GetWindowLongPtrW
+        set_window_long_ptr = user32.SetWindowLongPtrW
+        set_window_pos = user32.SetWindowPos
+
+        get_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_window_long_ptr.restype = _LONG_PTR
+        set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, _LONG_PTR]
+        set_window_long_ptr.restype = _LONG_PTR
+        set_window_pos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        set_window_pos.restype = wintypes.BOOL
+
+        tk_hwnd = int(hwnd)
+        native_hwnd_value = _resolve_native_window_hwnd(tk_hwnd)
+        if not native_hwnd_value:
+            logger.warning("no visible native HWND resolved from Tk HWND %#x", tk_hwnd)
+            return False
+
+        # Convert the visible top-level handle through the declared HWND type
+        # explicitly so this remains correct for a 64-bit frozen process as
+        # well as for a 32-bit Python process.
+        native_hwnd = wintypes.HWND(native_hwnd_value)
+        style_mask = WS_THICKFRAME | WS_SIZEBOX | WS_MAXIMIZEBOX
+
+        def _as_long_ptr_value(value) -> int:
+            return int(getattr(value, "value", value))
+
+        style_before = _as_long_ptr_value(get_window_long_ptr(native_hwnd, GWL_STYLE))
+        if not style_before:
+            logger.warning(
+                "GetWindowLongPtrW returned no style for visible HWND %#x (Tk HWND %#x)",
+                native_hwnd_value,
+                tk_hwnd,
+            )
+            return False
+
+        desired_style = (style_before & ~style_mask) | (
+            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+        )
+        previous_style = _as_long_ptr_value(
+            set_window_long_ptr(native_hwnd, GWL_STYLE, _LONG_PTR(desired_style))
+        )
+        # For a real Tk top-level, the old style is non-zero.  A zero return
+        # therefore indicates that SetWindowLongPtrW did not update this HWND;
+        # do not report success based only on SetWindowPos in that case.
+        if not previous_style:
+            logger.warning(
+                "SetWindowLongPtrW failed for visible HWND %#x (Tk HWND %#x)",
+                native_hwnd_value,
+                tk_hwnd,
+            )
+            return False
+
+        style_after_set = _as_long_ptr_value(get_window_long_ptr(native_hwnd, GWL_STYLE))
+        if style_after_set & style_mask:
+            logger.warning(
+                "native style still has resize/maximize bits after SetWindowLongPtrW: %#x",
+                style_after_set,
+            )
+            return False
+
+        frame_changed = bool(
+            set_window_pos(
+                native_hwnd,
+                wintypes.HWND(0),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_FRAMECHANGED,
+            )
+        )
+        if not frame_changed:
+            logger.warning(
+                "SetWindowPos(SWP_FRAMECHANGED) failed for visible HWND %#x (Tk HWND %#x)",
+                native_hwnd_value,
+                tk_hwnd,
+            )
+            return False
+
+        # Tk can adjust the frame while the toplevel is first mapped.  Read it
+        # again after FRAMECHANGED so callers never mistake an API call for a
+        # verified style change.
+        style_after_frame_change = _as_long_ptr_value(
+            get_window_long_ptr(native_hwnd, GWL_STYLE)
+        )
+        if style_after_frame_change & style_mask:
+            logger.warning(
+                "native style verification failed for HWND %#x: %#x",
+                native_hwnd_value,
+                style_after_frame_change,
+            )
+            return False
+        logger.debug(
+            "native resize/maximize style disabled for HWND %#x: %#x -> %#x",
+            native_hwnd_value,
+            style_before,
+            style_after_frame_change,
+        )
+        return True
+    except Exception as exc:
+        # Tk/headless test environments and restricted Windows sessions may
+        # not expose a usable HWND.  The normal Tk title bar remains usable.
+        logger.debug("native window style update skipped: %s", exc)
+        return False
 
 
 _DND_DIAGNOSTICS = {
@@ -132,6 +406,13 @@ def _detect_system_effective_theme() -> str:
     except Exception:
         pass
     return "dark"
+
+
+def _startup_theme_mode(environ=None):
+    """Choose the startup mode, keeping explicit environment overrides intact."""
+
+    environment = os.environ if environ is None else environ
+    return parse_theme_mode(environment.get("AITOOL_THEME", "dark"), fallback="dark")
 
 
 def _get_windows_work_areas(host) -> tuple[list[WorkArea], int]:
@@ -515,7 +796,7 @@ class WindowsIconCache:
 class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self) -> None:
         super().__init__()
-        self.theme_mode = parse_theme_mode(os.environ.get("AITOOL_THEME", "system"))
+        self.theme_mode = _startup_theme_mode()
         self.effective_theme = resolve_theme_mode(
             self.theme_mode,
             system_theme=_detect_system_effective_theme(),
@@ -525,6 +806,39 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
         self._geometry_save_job = None
         self._geometry_restoring = True
+        self._native_window_style_applied = False
+        self._native_window_style_reapply_scheduled = False
+        # Docking is deliberately separate from ``_pinned``.  The latter is
+        # only the Windows Z-order preference; these fields describe the
+        # temporary top-edge drawer transition.
+        self._dock_state = "free"
+        self._dock_work_area: WorkArea | None = None
+        self._dock_debounce_job = None
+        self._dock_autohide_job = None
+        self._dock_animation_job = None
+        self._dock_animation_serial = 0
+        self._dock_restore_blocked = True
+        self._dock_dragging = False
+        self._dock_drag_moved = False
+        self._dock_drag_expanded = False
+        self._dock_undock_blocked = False
+        self._dock_drag_origin = None
+        self._dock_pause_count = 0
+        self._dock_modal_windows: set[str] = set()
+        self._dock_drop_active = False
+        self._dock_handle_dnd_registered = False
+        self._dock_native_interaction = False
+        self._dock_native_interaction_job = None
+        self._dock_native_baseline: WindowGeometry | None = None
+        self._dock_native_size_changed = False
+        self._dock_resize_blocked = False
+        self._dock_expected_geometry: WindowGeometry | None = None
+        self._dock_expected_outer_position: tuple[int, int] | None = None
+        self._last_observed_geometry: WindowGeometry | None = None
+        self._dnd_target_widgets = weakref.WeakSet()
+        self._expanded_geometry: WindowGeometry | None = None
+        self._tray_restore_was_docked = False
+        self._dock_handle_height = 30
         self._init_storage()
         self._init_window()
         self._build_ui()
@@ -534,6 +848,10 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         try:
             self.drop_target_register(DND_FILES, DND_TEXT)
             self.dnd_bind("<<Drop>>", self._on_global_drop)
+            try:
+                self._dnd_target_widgets.add(self)
+            except TypeError:
+                pass
             _record_dnd_registration("target", self, True)
         except Exception as exc:
             _record_dnd_registration("target", self, False, exc)
@@ -543,8 +861,983 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         return self._tokens[name]
 
+    def _toggle_theme(self) -> None:
+        """Switch palettes immediately without changing the startup contract."""
+
+        self.theme_mode = toggle_theme_mode(self.effective_theme)
+        self.effective_theme = resolve_theme_mode(self.theme_mode)
+        self._refresh_theme()
+
+    def _refresh_theme(self) -> None:
+        """Apply the selected token palette to the complete main window.
+
+        Most of the existing UI intentionally passes concrete token values to
+        CustomTkinter and native Tk widgets.  Retint the existing widget tree,
+        then rebuild only the two dynamic item hosts through their established
+        refresh methods.  This keeps both canvas/scrollbar structures intact
+        and avoids moving the user away from either list.
+        """
+
+        station_view = self._station_canvas.yview() if hasattr(self, "_station_canvas") else None
+        actions_view = self._actions_canvas.yview() if hasattr(self, "_actions_canvas") else None
+
+        old_tokens = self._tokens
+        self._tokens = theme_tokens(self.effective_theme)
+        ctk.set_appearance_mode(self.effective_theme)
+
+        self.configure(fg_color=self._t("background"))
+        for widget in tuple(self.winfo_children()):
+            self._retint_widget_tree(widget, old_tokens)
+
+        if hasattr(self, "_dock_handle_label"):
+            self._dock_handle_label.configure(bg=self._t("surface"))
+            self._draw_dock_handle_icon()
+
+        if hasattr(self, "_app_icon_photo"):
+            try:
+                self._app_icon_photo = ImageTk.PhotoImage(self._create_app_icon())
+                self.iconphoto(True, self._app_icon_photo)
+            except Exception:
+                pass
+
+        self.btn_theme.configure(
+            text="☀ 亮色" if self.effective_theme == "dark" else "☾ 暗色",
+            fg_color=self._t("hover"),
+            hover_color=self._t("elevated"),
+            text_color=self._t("secondary"),
+        )
+        self.btn_pin.configure(
+            fg_color=self._t("hover"),
+            hover_color=self._t("elevated"),
+            text_color=self._t("pin_text"),
+        )
+        self._refresh_station()
+        self._refresh_cards()
+
+        def restore_scroll_positions() -> None:
+            if station_view and self._station_canvas.winfo_exists():
+                self._station_canvas.yview_moveto(station_view[0])
+            if actions_view and self._actions_canvas.winfo_exists():
+                self._actions_canvas.yview_moveto(actions_view[0])
+
+        self.after_idle(restore_scroll_positions)
+        self._set_status(f"已切换至{'亮色' if self.effective_theme == 'light' else '暗色'}主题", "ready")
+
+    def _retint_widget_tree(self, widget, old_tokens: dict[str, object]) -> None:
+        """Update token-backed options on CustomTkinter and native Tk widgets."""
+
+        def remap(value):
+            for name, old_value in old_tokens.items():
+                if isinstance(old_value, str) and value == old_value:
+                    return self._t(name)
+            return value
+
+        for option in (
+            "fg_color",
+            "bg_color",
+            "hover_color",
+            "button_color",
+            "button_hover_color",
+            "border_color",
+            "text_color",
+        ):
+            try:
+                current = widget.cget(option)
+                replacement = remap(current)
+                if replacement != current:
+                    widget.configure(**{option: replacement})
+            except Exception:
+                # Not every widget exposes every CustomTkinter option; native
+                # Tk widgets are handled by the options below.
+                pass
+
+        for option in ("background", "foreground", "bg", "fg"):
+            try:
+                current = widget.cget(option)
+                replacement = remap(current)
+                if replacement != current:
+                    widget.configure(**{option: replacement})
+            except Exception:
+                pass
+
+        for child in widget.winfo_children():
+            self._retint_widget_tree(child, old_tokens)
+
     def _finish_geometry_restore(self) -> None:
         self._geometry_restoring = False
+        self._dock_restore_blocked = False
+        self._clear_expected_geometry()
+        self._last_observed_geometry = self._current_window_geometry()
+        # A valid saved geometry may already touch the work-area edge.  Once
+        # restoration is complete, run the same observation path as a normal
+        # Configure event instead of requiring the user to move away first.
+        self._observe_window_position()
+
+    # ============================================================
+    # 顶部抽屉停靠
+    # ============================================================
+
+    _DOCK_EDGE_THRESHOLD = 12
+    _DOCK_DEBOUNCE_MS = 240
+    _DOCK_AUTOHIDE_MS = 1000
+    _DOCK_ANIMATION_STEPS = 14
+    _DOCK_ANIMATION_STEP_MS = 16
+    _DOCK_NATIVE_QUIET_MS = 180
+    _DOCK_SIZE_CHANGE_THRESHOLD = 24
+
+    def _cancel_dock_job(self, attribute: str) -> None:
+        job = getattr(self, attribute, None)
+        if job is None:
+            return
+        try:
+            self.after_cancel(job)
+        except Exception:
+            pass
+        setattr(self, attribute, None)
+
+    def _cancel_dock_animation(self) -> None:
+        self._dock_animation_serial += 1
+        self._cancel_dock_job("_dock_animation_job")
+        self._clear_expected_geometry()
+
+    def _cancel_dock_jobs(self) -> None:
+        self._cancel_dock_job("_dock_debounce_job")
+        self._cancel_dock_job("_dock_autohide_job")
+        self._cancel_dock_animation()
+
+    def _window_is_maximized(self) -> bool:
+        """Return the native maximized state without assuming a Windows API."""
+
+        try:
+            return str(self.state()).lower() in {"zoomed", "maximized"}
+        except Exception:
+            return False
+
+    def _native_resize_capability_available(self) -> bool:
+        """Return whether a native resize can still own Configure events.
+
+        Once the visible frame style has been verified, this app no longer
+        exposes native resize/Snap affordances.  A size change observed before
+        that verification is kept behind the conservative resize fence; a
+        verified non-resizable frame only needs the short native quiet period.
+        Non-Windows/headless runs have no native resize owner either.
+        """
+
+        return os.name == "nt" and not bool(
+            getattr(self, "_native_window_style_applied", False)
+        )
+
+    def _cancel_native_titlebar_interaction(self) -> None:
+        self._cancel_dock_job("_dock_native_interaction_job")
+        self._dock_native_interaction = False
+        self._dock_native_baseline = None
+        self._dock_native_size_changed = False
+        self._clear_expected_geometry()
+
+    def _begin_native_titlebar_interaction(self, geometry: WindowGeometry) -> None:
+        """Fence dock automation while Configure events come from the WM.
+
+        Tk does not expose a portable title-bar drag start/end event.  A short
+        quiet period around root Configure events gives native move/resize and
+        Windows Snap one owner of geometry at a time, while still allowing a
+        normal title-bar move to the top edge to be observed after the drag.
+        """
+
+        if not self._dock_native_interaction:
+            self._dock_native_baseline = geometry
+            self._dock_native_size_changed = False
+        self._dock_native_interaction = True
+        self._cancel_dock_jobs()
+        if self._dock_state in ("collapsing", "expanding"):
+            self._release_dock()
+        self._cancel_geometry_save_job()
+        self._arm_native_titlebar_quiet_timer(self._DOCK_NATIVE_QUIET_MS)
+
+    def _arm_native_titlebar_quiet_timer(self, delay: int) -> None:
+        """Restart the native Configure quiet period after every WM update."""
+
+        self._cancel_dock_job("_dock_native_interaction_job")
+        self._dock_native_interaction_job = self.after(
+            delay,
+            self._finish_native_titlebar_interaction,
+        )
+
+    def _finish_native_titlebar_interaction(self) -> None:
+        self._dock_native_interaction_job = None
+        if not self._dock_native_interaction:
+            return
+
+        geometry = self._current_window_geometry()
+        size_changed = self._dock_native_size_changed
+        self._dock_native_interaction = False
+        self._dock_native_baseline = None
+        self._dock_native_size_changed = False
+
+        if self._window_is_maximized():
+            self._dock_resize_blocked = True
+            self._cancel_dock_jobs()
+            if self._dock_state != "free":
+                self._release_dock()
+            self._last_observed_geometry = geometry
+            return
+
+        if size_changed:
+            self._dock_resize_blocked = True
+        self._observe_window_position()
+        if self._dock_state == "docked_expanded":
+            self._schedule_dock_autohide()
+        self._schedule_geometry_save()
+
+    def _dock_pause(self) -> None:
+        """Pause edge automation while a dialog or important operation owns UI."""
+
+        self._dock_pause_count += 1
+        self._cancel_dock_job("_dock_debounce_job")
+        self._cancel_dock_job("_dock_autohide_job")
+
+    def _dock_resume(self) -> None:
+        self._dock_pause_count = max(0, self._dock_pause_count - 1)
+        if self._dock_pause_count == 0 and self._dock_state == "docked_expanded":
+            self._schedule_dock_autohide()
+
+    def _bind_dock_modal(self, dialog) -> None:
+        """Track this modal independently from other dock pauses."""
+
+        key = str(dialog)
+        if key in self._dock_modal_windows:
+            return
+        self._dock_modal_windows.add(key)
+
+        def _on_destroy(event, target=dialog, target_key=key):
+            if event.widget is target and target_key in self._dock_modal_windows:
+                self._dock_modal_windows.discard(target_key)
+                if self._dock_state == "docked_expanded":
+                    self._schedule_dock_autohide()
+
+        dialog.bind("<Destroy>", _on_destroy, add="+")
+
+    def _dock_modal_present(self) -> bool:
+        # Keep the registered-modal state authoritative from the instant a
+        # dialog is bound.  ``grab_current`` can lag behind ``grab_set`` by a
+        # Tk event turn, and the pause count may also be shared with another
+        # operation.
+        if self._dock_modal_windows or self._dock_pause_count:
+            return True
+        try:
+            current_grab = self.grab_current()
+            return current_grab is not None and current_grab is not self
+        except Exception:
+            return False
+
+    @staticmethod
+    def _geometry_to_string(geometry: WindowGeometry) -> str:
+        x = f"+{geometry.x}" if geometry.x >= 0 else str(geometry.x)
+        y = f"+{geometry.y}" if geometry.y >= 0 else str(geometry.y)
+        return f"{geometry.width}x{geometry.height}{x}{y}"
+
+    def _current_window_geometry(self) -> WindowGeometry | None:
+        try:
+            import re
+
+            # Tk may expose a native negative absolute coordinate as
+            # ``widthxheight+x+-y`` after SetWindowPos.  Accept that spelling
+            # and normalize it back to the same WindowGeometry value; regular
+            # ``+x+y`` and ``-x-y`` forms remain unchanged.
+            match = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", self.geometry())
+            if match is None:
+                return None
+
+            def _parse_coordinate(value: str) -> int:
+                return int(value[1:]) if value.startswith("+") else int(value)
+
+            return WindowGeometry(
+                _parse_coordinate(match.group(3)), _parse_coordinate(match.group(4)),
+                int(match.group(1)), int(match.group(2)),
+            )
+        except Exception:
+            return None
+
+    def _window_outer_rect(self) -> tuple[int, int, int, int] | None:
+        """Return the screen-space window rectangle, including the title bar."""
+
+        if os.name == "nt":
+            try:
+                class _Rect(ctypes.Structure):
+                    _fields_ = [
+                        ("left", wintypes.LONG),
+                        ("top", wintypes.LONG),
+                        ("right", wintypes.LONG),
+                        ("bottom", wintypes.LONG),
+                    ]
+
+                rect = _Rect()
+                native_hwnd = _resolve_native_window_hwnd(int(self.winfo_id()))
+                if ctypes.windll.user32.GetWindowRect(native_hwnd, ctypes.byref(rect)):
+                    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+            except Exception:
+                pass
+
+        geometry = self._current_window_geometry()
+        if geometry is None:
+            return None
+        return geometry.x, geometry.y, geometry.x + geometry.width, geometry.y + geometry.height
+
+    def _window_outer_height(self) -> int:
+        rect = self._window_outer_rect()
+        if rect is not None:
+            return max(1, rect[3] - rect[1])
+        geometry = self._current_window_geometry()
+        return max(1, geometry.height if geometry is not None else self.winfo_height())
+
+    def _remember_expanded_geometry(self, geometry: WindowGeometry | None = None) -> None:
+        candidate = geometry or self._current_window_geometry()
+        if candidate is not None:
+            self._expanded_geometry = candidate
+
+    def _geometry_for_outer_position(
+        self,
+        x: int,
+        y: int,
+        geometry: WindowGeometry | None = None,
+    ) -> WindowGeometry | None:
+        current = geometry or self._current_window_geometry()
+        if current is None:
+            return None
+        rect = self._window_outer_rect()
+        if rect is None:
+            return WindowGeometry(x, y, current.width, current.height)
+        return WindowGeometry(
+            current.x + x - rect[0],
+            current.y + y - rect[1],
+            current.width,
+            current.height,
+        )
+
+    def _set_window_outer_position(self, x: int, y: int) -> bool:
+        # After a native negative move, Tk may report ``+x+-y`` temporarily,
+        # which is not a parseable Tk geometry string.  The native outer rect
+        # remains authoritative; retain the last acknowledged dimensions so
+        # later animation ticks do not stop after the first negative step.
+        current = (
+            self._current_window_geometry()
+            or self._dock_expected_geometry
+            or self._last_observed_geometry
+            or self._expanded_geometry
+        )
+        if current is None:
+            return False
+        target = self._geometry_for_outer_position(x, y, current)
+        if target is None:
+            return False
+
+        # A negative Tk coordinate is not an absolute screen coordinate: Tk
+        # treats ``-810`` as a bottom/right offset.  The collapsed drawer can
+        # legitimately have a negative absolute outer y, so move the native
+        # top-level HWND directly on Windows.  Still publish the corresponding
+        # Tk geometry and acknowledgement token so Configure/save handling
+        # remains owned by the existing animation contract.
+        if os.name == "nt" and (x < 0 or y < 0):
+            try:
+                hwnd = int(self.winfo_id())
+            except Exception:
+                hwnd = 0
+            # Install the acknowledgement before SetWindowPos can emit its
+            # Configure event; otherwise the native move can be mistaken for
+            # a title-bar drag by the existing quiet-timer path.
+            self._set_window_geometry(
+                target,
+                expected_outer_position=(x, y),
+                write_geometry=False,
+            )
+            if _set_native_window_position(hwnd, x, y):
+                return True
+
+            # A negative coordinate is an absolute screen coordinate only for
+            # SetWindowPos.  Passing it to Tk after a native failure would
+            # reinterpret it as a right/bottom offset and move the window to
+            # an unrelated position.  Leave this frame untouched instead.
+            self._clear_expected_geometry()
+            logger.warning(
+                "negative outer position was not applied; retaining current position at (%d, %d)",
+                x,
+                y,
+            )
+            return False
+
+        self._set_window_geometry(target, expected_outer_position=(x, y))
+        return True
+
+    def _set_window_geometry(
+        self,
+        geometry: WindowGeometry,
+        *,
+        expected_outer_position: tuple[int, int] | None = None,
+        write_geometry: bool = True,
+    ) -> None:
+        """Write geometry while fencing the Configure event it will produce.
+
+        Tk delivers root Configure events asynchronously.  Consequently a
+        geometry write made by the drawer animation can otherwise look exactly
+        like a title-bar drag by the time ``_schedule_geometry_save`` sees it.
+        Keep both the Tk geometry and (where available) the outer screen
+        position as an acknowledgement token for that one write.
+        """
+
+        self._cancel_native_titlebar_interaction()
+        self._dock_expected_geometry = geometry
+        self._dock_expected_outer_position = expected_outer_position
+        if write_geometry:
+            self.geometry(self._geometry_to_string(geometry))
+
+    def _clear_expected_geometry(self) -> None:
+        self._dock_expected_geometry = None
+        self._dock_expected_outer_position = None
+
+    def _configure_matches_expected_geometry(
+        self,
+        geometry: WindowGeometry,
+        outer_rect: tuple[int, int, int, int] | None = None,
+    ) -> bool:
+        expected = self._dock_expected_geometry
+        if expected is None:
+            return False
+        if geometry == expected:
+            return True
+
+        expected_outer = self._dock_expected_outer_position
+        return (
+            expected_outer is not None
+            and outer_rect is not None
+            and (outer_rect[0], outer_rect[1]) == expected_outer
+            and geometry.width == expected.width
+            and geometry.height == expected.height
+        )
+
+    def _set_window_y(self, y: int) -> None:
+        rect = self._window_outer_rect()
+        current = (
+            self._current_window_geometry()
+            or self._dock_expected_geometry
+            or self._last_observed_geometry
+            or self._expanded_geometry
+        )
+        if current is None:
+            return
+        x = rect[0] if rect is not None else current.x
+        self._set_window_outer_position(x, y)
+
+    def _cancel_geometry_save_job(self) -> None:
+        if self._geometry_save_job is None:
+            return
+        try:
+            self.after_cancel(self._geometry_save_job)
+        except Exception:
+            pass
+        self._geometry_save_job = None
+
+    def _dock_area_for_geometry(self, geometry: WindowGeometry | None = None) -> WorkArea | None:
+        candidate = geometry or self._current_window_geometry() or self._expanded_geometry
+        if candidate is None or not getattr(self, "_work_areas", None):
+            return None
+        try:
+            return select_work_area(candidate, self._work_areas, primary_index=self._primary_work_area_index)
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def _is_pointer_inside_window(self) -> bool:
+        # ``winfo_rootx/y`` describe the Tk client widget, but a native
+        # title-bar drag can leave the Tk coordinate model out of sync for a
+        # short time.  Query the visible top-level HWND first so the native
+        # caption is never mistaken for usable drawer content.
+        if os.name == "nt":
+            try:
+                class _Rect(ctypes.Structure):
+                    _fields_ = [
+                        ("left", wintypes.LONG),
+                        ("top", wintypes.LONG),
+                        ("right", wintypes.LONG),
+                        ("bottom", wintypes.LONG),
+                    ]
+
+                class _Point(ctypes.Structure):
+                    _fields_ = [
+                        ("x", wintypes.LONG),
+                        ("y", wintypes.LONG),
+                    ]
+
+                user32 = ctypes.windll.user32
+                get_client_rect = user32.GetClientRect
+                client_to_screen = user32.ClientToScreen
+                get_cursor_pos = user32.GetCursorPos
+                get_client_rect.argtypes = [
+                    wintypes.HWND,
+                    ctypes.POINTER(_Rect),
+                ]
+                get_client_rect.restype = wintypes.BOOL
+                client_to_screen.argtypes = [
+                    wintypes.HWND,
+                    ctypes.POINTER(_Point),
+                ]
+                client_to_screen.restype = wintypes.BOOL
+                get_cursor_pos.argtypes = [ctypes.POINTER(_Point)]
+                get_cursor_pos.restype = wintypes.BOOL
+
+                native_hwnd = _resolve_native_window_hwnd(int(self.winfo_id()))
+                if native_hwnd:
+                    hwnd = wintypes.HWND(native_hwnd)
+                    client_rect = _Rect()
+                    client_origin = _Point()
+                    cursor = _Point()
+                    if (
+                        get_client_rect(hwnd, ctypes.byref(client_rect))
+                        and client_to_screen(hwnd, ctypes.byref(client_origin))
+                        and get_cursor_pos(ctypes.byref(cursor))
+                    ):
+                        client_left = client_origin.x + client_rect.left
+                        client_top = client_origin.y + client_rect.top
+                        client_right = client_origin.x + client_rect.right
+                        client_bottom = client_origin.y + client_rect.bottom
+                        return (
+                            client_left <= cursor.x < client_right
+                            and client_top <= cursor.y < client_bottom
+                        )
+            except Exception:
+                # Tk/headless sessions and restricted Windows APIs retain the
+                # established Tk-coordinate fallback below.
+                pass
+
+        try:
+            pointer_x = int(self.winfo_pointerx())
+            pointer_y = int(self.winfo_pointery())
+        except Exception:
+            return False
+
+        # Prefer the Tk client area.  The native title bar is not part of the
+        # content that should keep the drawer expanded after a drag to the
+        # top edge, while a pointer over the client area should still do so.
+        try:
+            client_x = int(self.winfo_rootx())
+            client_y = int(self.winfo_rooty())
+            client_width = int(self.winfo_width())
+            client_height = int(self.winfo_height())
+            if client_width > 0 and client_height > 0:
+                return (
+                    client_x <= pointer_x < client_x + client_width
+                    and client_y <= pointer_y < client_y + client_height
+                )
+        except Exception:
+            pass
+
+        # Keep the existing screen-space fallback for environments where the
+        # Tk client rectangle cannot be queried.
+        try:
+            rect = self._window_outer_rect()
+            if rect is None:
+                return False
+            return (
+                rect[0] <= pointer_x < rect[2]
+                and rect[1] <= pointer_y < rect[3]
+            )
+        except Exception:
+            return False
+
+    def _observe_window_position(self) -> None:
+        """Use Configure as the native-titlebar move signal, never global Motion."""
+
+        if self._geometry_restoring or self._dock_restore_blocked or self._dock_dragging:
+            return
+        geometry = self._current_window_geometry()
+        if geometry is None:
+            return
+        outer_rect = self._window_outer_rect()
+        if outer_rect is None:
+            outer_top = geometry.y
+            docking_geometry = geometry
+        else:
+            outer_top = outer_rect[1]
+            docking_geometry = WindowGeometry(
+                outer_rect[0],
+                outer_rect[1],
+                max(1, outer_rect[2] - outer_rect[0]),
+                max(1, outer_rect[3] - outer_rect[1]),
+            )
+
+        if self._window_is_maximized():
+            self._dock_resize_blocked = True
+            self._cancel_dock_jobs()
+            if self._dock_state != "free":
+                self._release_dock()
+            return
+
+        if self._dock_native_interaction:
+            baseline = self._dock_native_baseline
+            if baseline is not None and (
+                abs(geometry.width - baseline.width) >= self._DOCK_SIZE_CHANGE_THRESHOLD
+                or abs(geometry.height - baseline.height) >= self._DOCK_SIZE_CHANGE_THRESHOLD
+            ):
+                self._dock_native_size_changed = True
+                self._dock_resize_blocked = True
+                self._cancel_dock_jobs()
+                if self._dock_state != "free":
+                    self._release_dock()
+            self._last_observed_geometry = geometry
+            return
+
+        if self._dock_resize_blocked:
+            area = self._dock_area_for_geometry(docking_geometry)
+            if area is None or outer_top > area.top + self._DOCK_EDGE_THRESHOLD:
+                self._dock_resize_blocked = False
+            elif (
+                not self._native_resize_capability_available()
+                and abs(outer_top - area.top) <= self._DOCK_EDGE_THRESHOLD
+            ):
+                # A verified non-resizable normal frame has no native resize
+                # owner left after the quiet timer.  Do not let a size-change
+                # fence permanently suppress a top-edge observation.  The
+                # maximized case returned above and a move away from the edge
+                # retain their existing protection semantics.
+                self._dock_resize_blocked = False
+            else:
+                self._cancel_dock_job("_dock_debounce_job")
+                self._last_observed_geometry = geometry
+                return
+
+        if self._dock_undock_blocked:
+            area = self._dock_work_area or self._dock_area_for_geometry(docking_geometry)
+            if area is None or outer_top <= area.top + self._DOCK_EDGE_THRESHOLD:
+                return
+            self._dock_undock_blocked = False
+
+        if self._dock_state == "docked_expanded":
+            area = self._dock_work_area
+            if area is not None and abs(outer_top - area.top) > self._DOCK_EDGE_THRESHOLD:
+                # A native title-bar drag away from the edge always releases
+                # docking.  From this point on ordinary Configure saves are
+                # allowed and no automatic collapse can follow the drag.
+                undock_near_edge = outer_top <= area.top + self._DOCK_EDGE_THRESHOLD
+                self._release_dock()
+                self._dock_undock_blocked = undock_near_edge
+            elif area is not None:
+                # Horizontal title-bar moves are still part of the docked
+                # expanded geometry and must survive a later tray restore.
+                self._remember_expanded_geometry(geometry)
+            return
+
+        if self._dock_state in ("collapsing", "expanding", "collapsed"):
+            return
+
+        area = self._dock_area_for_geometry(docking_geometry)
+        near_top = area is not None and abs(outer_top - area.top) <= self._DOCK_EDGE_THRESHOLD
+        if near_top and not self._dock_pause_count:
+            self._cancel_dock_job("_dock_debounce_job")
+            self._dock_debounce_job = self.after(self._DOCK_DEBOUNCE_MS, self._on_top_debounce)
+        else:
+            self._cancel_dock_job("_dock_debounce_job")
+        self._last_observed_geometry = geometry
+
+    def _on_top_debounce(self) -> None:
+        self._dock_debounce_job = None
+        if (
+            self._geometry_restoring
+            or self._dock_pause_count
+            or self._dock_native_interaction
+            or self._dock_resize_blocked
+            or self._window_is_maximized()
+            or self._dock_state != "free"
+        ):
+            return
+        geometry = self._current_window_geometry()
+        if geometry is None:
+            return
+        outer_rect = self._window_outer_rect()
+        if outer_rect is None:
+            outer_top = geometry.y
+            docking_geometry = geometry
+        else:
+            outer_top = outer_rect[1]
+            docking_geometry = WindowGeometry(
+                outer_rect[0],
+                outer_rect[1],
+                max(1, outer_rect[2] - outer_rect[0]),
+                max(1, outer_rect[3] - outer_rect[1]),
+            )
+        area = self._dock_area_for_geometry(docking_geometry)
+        if area is None or abs(outer_top - area.top) > self._DOCK_EDGE_THRESHOLD:
+            return
+        self._dock_work_area = area
+        self._remember_expanded_geometry(geometry)
+        self._start_dock_animation(area.top, "docked_expanded")
+
+    def _release_dock(self) -> None:
+        self._cancel_dock_jobs()
+        self._dock_state = "free"
+        self._dock_work_area = None
+        self._dock_dragging = False
+        self._dock_undock_blocked = False
+        self._hide_dock_handle()
+        self._remember_expanded_geometry()
+
+    def _start_dock_animation(self, target_y: int, final_state: str) -> None:
+        if self._dock_native_interaction or self._window_is_maximized():
+            return
+        current = self._current_window_geometry()
+        if current is None:
+            return
+        current_rect = self._window_outer_rect()
+
+        # Cancelling first makes a fast reverse start from the current
+        # interpolated y instead of stacking callbacks from both directions.
+        self._cancel_dock_animation()
+        self._cancel_dock_job("_dock_debounce_job")
+        self._cancel_dock_job("_dock_autohide_job")
+        self._cancel_geometry_save_job()
+        start_y = current_rect[1] if current_rect is not None else current.y
+        if start_y == target_y:
+            self._set_window_y(target_y)
+            self._dock_state = final_state
+            if final_state == "collapsed":
+                self._show_dock_handle()
+            else:
+                self._hide_dock_handle()
+                self._remember_expanded_geometry(self._current_window_geometry())
+                if final_state == "docked_expanded":
+                    self._schedule_dock_autohide()
+            return
+
+        self._dock_state = "collapsing" if final_state == "collapsed" else "expanding"
+        # Keep the handle over the moving statusbar during expansion.  A
+        # press that arrives immediately after Enter can therefore cancel the
+        # reverse animation and start a deliberate drag instead of losing the
+        # only visible drag target.
+        serial = self._dock_animation_serial
+        step = 0
+
+        def _tick() -> None:
+            nonlocal step
+            if serial != self._dock_animation_serial:
+                return
+            step += 1
+            ratio = min(1.0, step / self._DOCK_ANIMATION_STEPS)
+            y = round(start_y + (target_y - start_y) * ratio)
+            self._set_window_y(y)
+            if ratio >= 1.0:
+                self._dock_animation_job = None
+                self._dock_state = final_state
+                if final_state == "collapsed":
+                    self._show_dock_handle()
+                else:
+                    self._hide_dock_handle()
+                    self._remember_expanded_geometry(self._current_window_geometry())
+                    if final_state == "docked_expanded":
+                        self._schedule_dock_autohide()
+                return
+            self._dock_animation_job = self.after(self._DOCK_ANIMATION_STEP_MS, _tick)
+
+        self._dock_animation_job = self.after(self._DOCK_ANIMATION_STEP_MS, _tick)
+
+    def _request_dock_collapse(self) -> None:
+        if (
+            self._dock_state != "docked_expanded"
+            or self._dock_pause_count
+            or self._dock_native_interaction
+            or self._dock_resize_blocked
+            or self._window_is_maximized()
+        ):
+            return
+        area = self._dock_work_area
+        geometry = self._current_window_geometry()
+        if area is None or geometry is None:
+            return
+        self._start_dock_animation(
+            area.top - self._window_outer_height() + self._dock_handle_height,
+            "collapsed",
+        )
+
+    def _request_dock_expand(self) -> None:
+        if self._dock_state not in ("collapsed", "collapsing", "expanding"):
+            return
+        area = self._dock_work_area or self._dock_area_for_geometry(self._expanded_geometry)
+        if area is None:
+            return
+        self._dock_work_area = area
+        self._start_dock_animation(area.top, "docked_expanded")
+
+    def _schedule_dock_autohide(self) -> None:
+        self._cancel_dock_job("_dock_autohide_job")
+        if (
+            self._dock_state != "docked_expanded"
+            or self._dock_modal_present()
+            or self._dock_native_interaction
+            or self._window_is_maximized()
+        ):
+            return
+        delay = 250 if self._dock_resize_blocked else self._DOCK_AUTOHIDE_MS
+        self._dock_autohide_job = self.after(delay, self._autohide_if_pointer_left)
+
+    def _autohide_if_pointer_left(self) -> None:
+        self._dock_autohide_job = None
+        if self._dock_state != "docked_expanded" or self._window_is_maximized():
+            return
+
+        # Native Configure events temporarily own geometry.  Do not collapse
+        # against that owner, but do keep polling; otherwise the one-shot timer
+        # is lost while a native interaction is settling.
+        if self._dock_native_interaction:
+            self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
+            return
+
+        # Once the quiet period has ended, a verified non-resizable normal
+        # frame cannot still have a real native resize owner.  Clear only this
+        # stale fence while the drawer is already docked and expanded; the
+        # maximized case returned above and native interaction case above keep
+        # their protection semantics.
+        if self._dock_resize_blocked:
+            resize_capability = getattr(self, "_native_resize_capability_available", None)
+            native_resize_available = (
+                resize_capability() if resize_capability is not None else True
+            )
+            if not native_resize_available:
+                self._dock_resize_blocked = False
+            else:
+                self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
+                return
+
+        if self._dock_modal_present():
+            self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
+            return
+
+        # The native title bar is outside the Tk root's Enter/Leave stream;
+        # polling the Tk client area keeps the window open while the pointer
+        # is over usable content without requiring a title-bar Leave event.
+        if self._is_pointer_inside_window():
+            self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
+            return
+        self._request_dock_collapse()
+
+    def _on_dock_enter(self, _event=None) -> None:
+        if self._dock_state == "docked_expanded":
+            self._schedule_dock_autohide()
+
+    def _on_dock_leave(self, _event=None) -> None:
+        if self._dock_state == "docked_expanded":
+            self._schedule_dock_autohide()
+
+    def _show_dock_handle(self) -> None:
+        if not hasattr(self, "_dock_handle"):
+            return
+        self._register_dock_handle_dnd()
+        self.status_dot.grid_remove()
+        self.status_label.grid_remove()
+        self._dock_handle.place(
+            x=0,
+            y=0,
+            relwidth=1.0,
+            relheight=1.0,
+        )
+        self._dock_handle.lift()
+
+    def _hide_dock_handle(self) -> None:
+        if not hasattr(self, "_dock_handle"):
+            return
+        self._dock_handle.place_forget()
+        self.status_dot.grid()
+        self.status_label.grid()
+
+    def _register_dock_handle_dnd(self) -> None:
+        """Register the visible handle as a full DND_FILES/DND_TEXT target."""
+
+        if self._dock_handle_dnd_registered or not hasattr(self, "_dock_handle"):
+            return
+        # DND events do not bubble through Tk.  Register the handle and its
+        # child labels explicitly so a drop anywhere on the narrow bar works.
+        _DND_DIAGNOSTICS["generation"] += 1
+        self._register_dnd_target(self._dock_handle)
+        for child in self._dock_handle.winfo_children():
+            self._register_dnd_recursive(child, _generation_started=True)
+        self._dock_handle_dnd_registered = True
+
+    def _on_dock_handle_enter(self, _event=None) -> None:
+        self._on_dock_enter()
+        if not self._dock_dragging and not self._dock_drop_active:
+            self._request_dock_expand()
+
+    def _on_dock_handle_motion(self, event) -> None:
+        """Keep the handle interactive while an expansion animation is running."""
+
+        if self._dock_dragging:
+            self._on_dock_handle_drag_motion(event)
+
+    def _on_dock_handle_leave(self, _event=None) -> None:
+        # Do not schedule an autohide while the bar is being dragged or while
+        # its pointer is causing the expand animation to reverse.
+        if not self._dock_dragging:
+            self._on_dock_leave()
+
+    def _on_dock_handle_press(self, event) -> None:
+        self._cancel_dock_animation()
+        self._cancel_dock_job("_dock_autohide_job")
+        geometry = self._current_window_geometry()
+        if geometry is None:
+            return
+        rect = self._window_outer_rect()
+        start_x = rect[0] if rect is not None else geometry.x
+        start_y = rect[1] if rect is not None else geometry.y
+        self._dock_dragging = True
+        self._dock_drag_moved = False
+        self._dock_drag_expanded = False
+        self._dock_drag_origin = (event.x_root, event.y_root, start_x, start_y)
+        self._dock_state = "collapsed"
+
+    def _on_dock_handle_drag_motion(self, event) -> None:
+        if not self._dock_dragging or self._dock_drag_origin is None:
+            return
+        origin_x, origin_y, start_x, start_y = self._dock_drag_origin
+        geometry = self._current_window_geometry()
+        if geometry is None:
+            return
+        rect = self._window_outer_rect()
+        outer_width = rect[2] - rect[0] if rect is not None else geometry.width
+        outer_height = rect[3] - rect[1] if rect is not None else geometry.height
+        new_x = start_x + int(event.x_root - origin_x)
+        new_y = start_y + int(event.y_root - origin_y)
+        self._dock_drag_moved = self._dock_drag_moved or abs(new_x - start_x) > 2 or abs(new_y - start_y) > 2
+        area = self._dock_work_area
+        collapsed_y = area.top - outer_height + self._dock_handle_height if area is not None else start_y
+        if area is not None and new_y > collapsed_y + 12:
+            # Pulling the bar down far enough is an intentional vertical
+            # undock.  Keep the native title bar and all normal drag behavior.
+            self._dock_state = "free"
+            self._dock_work_area = None
+            self._dock_drag_expanded = True
+            self._dock_undock_blocked = True
+            # Release the handle at a safe offset below the edge.  This keeps
+            # the intentional undock from immediately re-triggering debounce.
+            new_y = area.top + self._DOCK_EDGE_THRESHOLD + 4
+            self._hide_dock_handle()
+        if area is not None:
+            new_x = min(max(new_x, area.left), area.right - outer_width)
+        self._set_window_outer_position(new_x, new_y)
+        current = self._current_window_geometry() or geometry
+        if self._dock_state == "collapsed":
+            expanded = self._geometry_for_outer_position(new_x, area.top if area else new_y, current)
+            self._remember_expanded_geometry(expanded)
+        else:
+            self._remember_expanded_geometry(current)
+
+    def _on_dock_handle_release(self, _event=None) -> None:
+        self._dock_dragging = False
+        self._dock_drag_origin = None
+        self._clear_expected_geometry()
+        was_moved = self._dock_drag_moved
+        self._dock_drag_moved = False
+        if self._dock_state == "free":
+            self._hide_dock_handle()
+        elif self._dock_state == "collapsed" and not was_moved:
+            self._request_dock_expand()
+        if self._dock_state == "collapsed":
+            self._schedule_geometry_save()
+        elif self._dock_state == "free":
+            self._schedule_geometry_save()
 
     def _on_mousewheel(self, event):
         self._scroll_canvas(self._actions_canvas, event)
@@ -631,21 +1924,98 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         if getattr(self, "_geometry_restoring", False):
             return
         try:
-            import re
-
-            match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self.geometry())
-            if match is None:
+            candidate = self._expanded_geometry if self._dock_state in {
+                "collapsing", "collapsed", "expanding", "docked_expanded",
+            } else self._current_window_geometry()
+            if candidate is None:
                 return
-            candidate = WindowGeometry(
-                int(match.group(3)), int(match.group(4)),
-                int(match.group(1)), int(match.group(2)),
-            )
             save_window_geometry(WINDOW_GEOMETRY_PATH, candidate)
         except Exception as exc:
             logger.debug("window geometry save skipped: %s", exc)
 
+    def _apply_native_window_style_once(self) -> bool:
+        """Apply the non-resizable native-frame contract once per visible HWND."""
+
+        if self._native_window_style_applied:
+            return True
+        try:
+            tk_hwnd = int(self.winfo_id())
+        except Exception as exc:
+            logger.debug("native window HWND unavailable: %s", exc)
+            return False
+        verified = _disable_native_resize_and_maximize(tk_hwnd)
+        if verified:
+            self._native_window_style_applied = True
+        return verified
+
+    def _reapply_native_window_style_after_map(self, _event=None) -> None:
+        """Verify the frame after Tk has displayed or remapped the toplevel.
+
+        Tk may recreate or adjust native frame styles while mapping a window.
+        The idle callback catches the initial startup race, while the Map
+        binding below also protects the same visible HWND after a tray
+        withdraw/deiconify cycle.  This remains independent of Configure
+        handling: it never rewrites the style on every geometry event.
+        """
+
+        try:
+            self.update_idletasks()
+            hwnd = int(self.winfo_id())
+            verified = _disable_native_resize_and_maximize(hwnd)
+            if verified:
+                self._native_window_style_applied = True
+        except Exception as exc:
+            logger.debug("post-map native window style verification skipped: %s", exc)
+
+    def _schedule_native_window_style_reapply(self) -> None:
+        """Schedule exactly one post-map style verification."""
+
+        if self._native_window_style_reapply_scheduled:
+            return
+        self._native_window_style_reapply_scheduled = True
+        try:
+            self.bind("<Map>", self._reapply_native_window_style_after_map, add="+")
+            self.after_idle(self._reapply_native_window_style_after_map)
+        except Exception as exc:
+            logger.debug("post-map native window style scheduling skipped: %s", exc)
+
     def _schedule_geometry_save(self, _event=None) -> None:
+        if (
+            _event is not None
+            and not self._dock_dragging
+            and self._dock_state not in ("collapsing", "expanding")
+            and not self._dock_restore_blocked
+        ):
+            geometry = self._current_window_geometry()
+            if geometry is not None:
+                expected_event = self._configure_matches_expected_geometry(
+                    geometry,
+                    self._window_outer_rect(),
+                )
+                # Always consume the acknowledgement token.  Leaving a
+                # mismatching token behind after a native move makes every
+                # later Configure event look like the same old move and can
+                # keep the native quiet timer alive forever.
+                self._clear_expected_geometry()
+                if not expected_event:
+                    if not self._dock_native_interaction:
+                        self._begin_native_titlebar_interaction(
+                            self._last_observed_geometry or geometry,
+                        )
+                    else:
+                        # A drag emits a stream of Configure events.  The
+                        # quiet timer must follow the last one, not the first,
+                        # or a still-moving native window can start docking.
+                        self._arm_native_titlebar_quiet_timer(self._DOCK_NATIVE_QUIET_MS)
+                self._last_observed_geometry = geometry
+        self._observe_window_position()
         if self._geometry_restoring:
+            return
+        if (
+            self._dock_state in ("collapsing", "expanding")
+            or self._dock_dragging
+            or self._dock_native_interaction
+        ):
             return
         if self._geometry_save_job is not None:
             try:
@@ -657,6 +2027,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _init_window(self) -> None:
         self.title("AiTool")
         work_areas, primary_index = _get_windows_work_areas(self)
+        self._work_areas = work_areas
+        self._primary_work_area_index = primary_index
         restored = load_and_place_window_geometry(
             WINDOW_GEOMETRY_PATH,
             work_areas,
@@ -670,10 +2042,21 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         x_geometry = f"+{restored.x}" if restored.x >= 0 else str(restored.x)
         y_geometry = f"+{restored.y}" if restored.y >= 0 else str(restored.y)
         self.geometry(f"{restored.width}x{restored.height}{x_geometry}{y_geometry}")
+        self._expanded_geometry = restored
         self.configure(fg_color=self._t("background"))
         self.attributes("-topmost", True)
         self._pinned = True
         self.overrideredirect(False)
+        # ``super().__init__`` has created the Tk toplevel by this point.  Flush
+        # pending window-manager work before querying its HWND, then update the
+        # native style before binding Configure so FRAMECHANGED cannot look like
+        # a user title-bar drag.
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        self._apply_native_window_style_once()
+        self._schedule_native_window_style_reapply()
 
         # 设置 Windows 任务栏和左上角的应用程序窗口图标，与托盘图标完美保持一致！
         try:
@@ -727,13 +2110,14 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             import keyboard
             
             def _toggle_gui():
-                # 根据当前窗口的显示状态智能切换
-                if self.winfo_viewable():
-                    # 当前可见，则将其优雅退避隐藏到系统托盘常驻
-                    self.after(0, self._minimize_to_tray)
-                else:
-                    # 当前隐藏，则立刻闪现最前对齐唤醒
+                # 收起只是顶部停靠状态，不等同于托盘隐藏。
+                if not self.winfo_viewable():
                     self.after(0, self._restore_from_tray)
+                elif self._dock_state in ("collapsed", "collapsing", "expanding"):
+                    self.after(0, self._request_dock_expand)
+                else:
+                    # 保留原有契约：正常可见时 Alt+A 进入托盘。
+                    self.after(0, self._minimize_to_tray)
 
             # 在后台注册全局热键 Alt + A / alt+a (忽略大小写)
             keyboard.add_hotkey("alt+a", _toggle_gui, suppress=True)
@@ -795,8 +2179,13 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _show_settings_dialog(self, icon=None, item=None) -> None:
         """显示设置弹窗。为了保证在主窗口被隐藏（withdraw）时也能正常设置，在主线程中唤起设置弹窗。"""
         def _build_dialog():
+            self._cancel_dock_jobs()
             self.deiconify()
-            self.attributes("-topmost", True)
+            restored = self._expanded_geometry or self._current_window_geometry()
+            if restored is not None:
+                self._set_window_geometry(restored)
+            self._dock_state = "free"
+            self.attributes("-topmost", self._pinned)
             self.focus_force()
 
             dialog = ctk.CTkToplevel(self)
@@ -806,6 +2195,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             dialog.configure(fg_color=self._t("background"))
             dialog.transient(self)
             dialog.grab_set()
+            self._bind_dock_modal(dialog)
 
             ctk.CTkLabel(dialog, text="⚙️ AiTool 桌面工具 设置中心",
                          font=ctk.CTkFont(family=FONT, size=13, weight="bold"),
@@ -836,7 +2226,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                                       text_color=self._t("focus"))
             hotkey_lbl.pack(pady=4)
 
-            ctk.CTkLabel(dialog, text="在任何界面按 Alt + A，即可快速闪现/退避隐藏窗口",
+            ctk.CTkLabel(dialog, text="Alt + A：展开 AiTool；已展开时再次按下可最小化到托盘",
                          font=ctk.CTkFont(family=FONT, size=9),
                          text_color=self._t("muted")).pack(pady=(0, 16))
 
@@ -849,6 +2239,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _quit_from_tray(self) -> None:
         """在 Tk 主线程中完成托盘退出，避免从 pystray 线程触碰 Tk。"""
+        self._cancel_dock_jobs()
+        if self._dock_state == "free":
+            self._remember_expanded_geometry(self._current_window_geometry())
+        else:
+            self._remember_expanded_geometry(self._expanded_geometry)
         self._save_window_geometry_now()
 
         tray_icon = self._tray_icon
@@ -863,6 +2258,14 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _minimize_to_tray(self) -> None:
         """隐藏窗口并在系统托盘中生成一个精美的托盘图标。"""
+        self._tray_restore_was_docked = self._dock_state in {
+            "docked_expanded", "collapsing", "collapsed", "expanding",
+        }
+        self._cancel_dock_jobs()
+        if self._tray_restore_was_docked:
+            self._remember_expanded_geometry(self._expanded_geometry)
+        else:
+            self._remember_expanded_geometry(self._current_window_geometry())
         self._save_window_geometry_now()
         self.withdraw() # 隐藏主窗口
 
@@ -902,9 +2305,30 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _restore_from_tray(self) -> None:
         """从托盘恢复窗口显示"""
+        self._cancel_dock_jobs()
+        self._dock_restore_blocked = True
         self.deiconify()
         self.attributes("-topmost", self._pinned)
         self.focus_force()
+        restored = self._expanded_geometry or self._current_window_geometry()
+        if restored is not None:
+            self._set_window_geometry(restored)
+        if self._tray_restore_was_docked:
+            area = self._dock_area_for_geometry(restored)
+            if area is not None:
+                self._dock_work_area = area
+                self._dock_state = "docked_expanded"
+                self._hide_dock_handle()
+                self._schedule_dock_autohide()
+        else:
+            self._dock_state = "free"
+        self._tray_restore_was_docked = False
+        self.after_idle(self._finish_tray_restore)
+
+    def _finish_tray_restore(self) -> None:
+        self._dock_restore_blocked = False
+        if self._dock_state == "docked_expanded":
+            self._schedule_dock_autohide()
 
     # ============================================================
     # UI 构建
@@ -928,6 +2352,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._build_statusbar()
 
         self.bind_all("<Control-v>", self._on_paste)
+        self.bind("<Enter>", self._on_dock_enter, add="+")
+        self.bind("<Leave>", self._on_dock_leave, add="+")
 
     def _build_station_area(self) -> None:
         import tkinter as tk
@@ -950,11 +2376,26 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkLabel(header, text="拖入收藏 · 拖出复制 · 双击打开",
                      font=ctk.CTkFont(family=FONT, size=FS["status"] - 1), text_color=self._t("muted")).grid(row=0, column=1, sticky="e")
 
+        self.btn_theme = ctk.CTkButton(
+            header,
+            text="☀ 亮色" if self.effective_theme == "dark" else "☾ 暗色",
+            width=52,
+            height=24,
+            corner_radius=12,
+            fg_color=self._t("hover"),
+            hover_color=self._t("elevated"),
+            text_color=self._t("secondary"),
+            font=ctk.CTkFont(family=FONT, size=9),
+            command=self._toggle_theme,
+        )
+        self.btn_theme.grid(row=0, column=2, padx=(SPACING["xs"], 0))
+
         self.btn_pin = ctk.CTkButton(header, text="📌", width=24, height=24, corner_radius=12,
                                      fg_color=self._t("hover"), hover_color=self._t("elevated"),
+                                     text_color=self._t("pin_text"),
                                      font=ctk.CTkFont(family=FONT, size=11),
                                      command=self._toggle_pin)
-        self.btn_pin.grid(row=0, column=2, padx=(SPACING["xs"] + 2, 0))
+        self.btn_pin.grid(row=0, column=3, padx=(SPACING["xs"] + 2, 0))
         self._register_dnd_recursive(header)
 
         self.station_scroll = ctk.CTkFrame(self.station_section, fg_color=self._t("surface"), corner_radius=0)
@@ -1020,6 +2461,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_dnd_recursive(self.actions_scroll)
 
     def _build_statusbar(self) -> None:
+        import tkinter as tk
+
         self.statusbar = ctk.CTkFrame(self, fg_color=self._t("surface"), height=30, corner_radius=0)
         self.statusbar.grid(row=1, column=0, sticky="ew")
         self.statusbar.grid_propagate(False)
@@ -1030,10 +2473,87 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                                        font=ctk.CTkFont(family=FONT, size=9))
         self.status_dot.grid(row=0, column=0, padx=(SPACING["md"], SPACING["xs"]))
 
-        self.status_label = ctk.CTkLabel(self.statusbar, text="就绪", font=ctk.CTkFont(family=FONT, size=FS["status"]),
+        self.status_label = ctk.CTkLabel(self.statusbar, text="就绪，拖动至桌面上边缘可隐藏", font=ctk.CTkFont(family=FONT, size=FS["status"]),
                                          text_color=self._t("secondary"))
         self.status_label.grid(row=0, column=1, sticky="w")
         self._register_dnd_recursive(self.statusbar)
+
+        # The handle remains in the fixed statusbar and outside both scrolling
+        # hosts.  It is only placed over the statusbar while the window is
+        # collapsed, so the root -> content/statusbar contract stays intact.
+        self._dock_handle = ctk.CTkFrame(
+            self.statusbar,
+            fg_color=self._t("surface"),
+            border_width=1,
+            border_color=self._t("border"),
+            corner_radius=0,
+        )
+        self._dock_handle.grid_columnconfigure(0, weight=1)
+        self._dock_handle.grid_rowconfigure(0, weight=1)
+        self._dock_handle_label = tk.Canvas(
+            self._dock_handle,
+            bg=self._t("surface"),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self._dock_handle_label.grid(row=0, column=0, sticky="nsew")
+        self._dock_handle_label.bind("<Configure>", self._draw_dock_handle_icon, add="+")
+        self._draw_dock_handle_icon()
+
+        for widget in (self._dock_handle, self._dock_handle_label):
+            widget.bind("<Enter>", self._on_dock_handle_enter, add="+")
+            widget.bind("<Leave>", self._on_dock_handle_leave, add="+")
+            widget.bind("<ButtonPress-1>", self._on_dock_handle_press, add="+")
+            widget.bind("<B1-Motion>", self._on_dock_handle_motion, add="+")
+            widget.bind("<ButtonRelease-1>", self._on_dock_handle_release, add="+")
+
+    def _draw_dock_handle_icon(self, _event=None) -> None:
+        """Draw the centered three-line grip on the collapsed dock handle."""
+
+        canvas = getattr(self, "_dock_handle_label", None)
+        if canvas is None:
+            return
+
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        center_x = width / 2
+        center_y = height / 2
+        icon_center_y = center_y + 2
+        left_x = center_x - 14
+        right_x = center_x + 14
+
+        canvas.delete("dock_handle_icon")
+        canvas.create_line(
+            left_x,
+            icon_center_y - 3,
+            right_x,
+            icon_center_y - 3,
+            fill=self._t("secondary"),
+            width=1,
+            capstyle="round",
+            tags="dock_handle_icon",
+        )
+        canvas.create_line(
+            left_x,
+            icon_center_y,
+            right_x,
+            icon_center_y,
+            fill=self._t("secondary"),
+            width=1,
+            capstyle="round",
+            tags="dock_handle_icon",
+        )
+        canvas.create_line(
+            left_x,
+            icon_center_y + 3,
+            right_x,
+            icon_center_y + 3,
+            fill=self._t("secondary"),
+            width=1,
+            capstyle="round",
+            tags="dock_handle_icon",
+        )
 
     # ============================================================
     # 数据刷新
@@ -1153,6 +2673,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             try:
                 w.drag_source_register(1, DND_FILES)
                 w.dnd_bind("<<DragInitCmd>>", lambda e, ent=entry: self._on_station_drag_out(ent))
+                w.dnd_bind("<<DragEndCmd>>", lambda e: self._on_station_drag_end())
                 _record_dnd_registration("source", w, True)
             except Exception as exc:
                 _record_dnd_registration("source", w, False, exc)
@@ -1168,8 +2689,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                      text_color=self._t("secondary")).grid(row=0, column=0, sticky="w")
 
         self.btn_add = ctk.CTkButton(header, text="➕", width=24, height=24, corner_radius=12,
-                                     fg_color=self._t("primary"), hover_color=self._t("focus"),
-                                     text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=9),
+                                     fg_color=self._t("add_button"), hover_color=self._t("add_button_hover"),
+                                     text_color=self._t("add_button_text"), font=ctk.CTkFont(family=FONT, size=9),
                                      command=self._show_add_menu)
         self.btn_add.grid(row=0, column=2, padx=(SPACING["xs"], 0))
 
@@ -1305,10 +2826,21 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _register_dnd_target(self, widget) -> None:
         """显式注册一个稳定 DND 容器，并把结果写入诊断快照。"""
         try:
+            if widget in self._dnd_target_widgets:
+                return
+        except TypeError:
+            # Tk widgets are weak-referenceable in normal operation.  Keep a
+            # direct registration path for a minimal/headless sentinel.
+            pass
+        try:
             widget.drop_target_register(DND_FILES, DND_TEXT)
             widget.dnd_bind("<<Drop>>", self._on_global_drop)
             widget.dnd_bind("<<DragEnter>>", self._on_global_drag_enter)
             widget.dnd_bind("<<DragLeave>>", self._on_global_drag_leave)
+            try:
+                self._dnd_target_widgets.add(widget)
+            except TypeError:
+                pass
             _record_dnd_registration("target", widget, True)
         except Exception as exc:
             _record_dnd_registration("target", widget, False, exc)
@@ -1326,9 +2858,15 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._register_dnd_recursive(child, _generation_started=True)
 
     def _on_global_drag_enter(self, event) -> None:
+        if not self._dock_drop_active:
+            self._dock_drop_active = True
+            self._dock_pause()
         self._set_status("拖入文件...", "warning")
 
     def _on_global_drag_leave(self, event) -> None:
+        if self._dock_drop_active:
+            self._dock_drop_active = False
+            self._dock_resume()
         self._set_status("就绪", "ready")
 
     def _on_paste(self, event=None) -> None:
@@ -1339,6 +2877,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             return
         if not raw_data:
             return
+        if self._dock_state in ("collapsed", "collapsing"):
+            self._request_dock_expand()
         self._set_status("粘贴添加...", "warning")
         self._process_input_data(raw_data, paths_source=None)
 
@@ -1349,6 +2889,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._process_input_data(raw_data, paths_source)
         except Exception:
             logger.exception("_on_global_drop failed")
+        finally:
+            if self._dock_drop_active:
+                self._dock_drop_active = False
+                self._dock_resume()
+            if self._dock_state in ("collapsed", "collapsing"):
+                self._request_dock_expand()
 
     def _process_input_data(self, raw_data: str, paths_source=None) -> None:
         """智能识别并添加模块/收藏。拖拽和粘贴共用此逻辑。
@@ -1401,9 +2947,17 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _on_station_drag_out(self, entry: StationEntry):
         """从中转站拖出文件到系统资源管理器。"""
+        self._dock_drop_active = True
+        self._dock_pause()
         from tkinterdnd2 import COPY
         tcl_path = "{" + entry.path + "}"
         return (COPY, DND_FILES, tcl_path)
+
+    def _on_station_drag_end(self) -> None:
+        if not self._dock_drop_active:
+            return
+        self._dock_drop_active = False
+        self._dock_resume()
 
     # ============================================================
     # 中转站操作
@@ -1417,7 +2971,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if p.parent.exists():
                 folder_path = p.parent
             else:
-                messagebox.showwarning("入口失效", "所选路径及其所在文件夹均已不存在。", parent=self)
+                self._dock_pause()
+                try:
+                    messagebox.showwarning("入口失效", "所选路径及其所在文件夹均已不存在。", parent=self)
+                finally:
+                    self._dock_resume()
                 return
         else:
             folder_path = p.parent
@@ -1443,7 +3001,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _open_entry(self, entry: StationEntry) -> None:
         p = Path(entry.path)
         if not p.exists():
-            messagebox.showwarning("入口失效", "所选入口已不存在。", parent=self)
+            self._dock_pause()
+            try:
+                messagebox.showwarning("入口失效", "所选入口已不存在。", parent=self)
+            finally:
+                self._dock_resume()
             return
         if hasattr(os, "startfile"):
             os.startfile(str(p))
@@ -1466,7 +3028,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._toast("已移除", "success")
 
     def _copy_entry_to(self, entry: StationEntry) -> None:
-        target = filedialog.askdirectory(title="选择导出目录", parent=self)
+        self._dock_pause()
+        try:
+            target = filedialog.askdirectory(title="选择导出目录", parent=self)
+        finally:
+            self._dock_resume()
         if not target:
             return
         ok, message = copy_station_entry_to_directory(entry, Path(target))
@@ -1481,7 +3047,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _execute_card(self, card: dict) -> None:
         if card.get("need_confirm"):
-            if not messagebox.askyesno("确认执行", f"{card['title']}\n\n确认执行？", parent=self):
+            self._dock_pause()
+            try:
+                confirmed = messagebox.askyesno("确认执行", f"{card['title']}\n\n确认执行？", parent=self)
+            finally:
+                self._dock_resume()
+            if not confirmed:
                 self._set_status("已取消", "ready")
                 return
 
@@ -1492,6 +3063,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         # - 痛点：文件拷贝属于重度磁盘 I/O 阻塞任务，如果静默在后台跑，用户会觉得“卡死”或“根本没反应”。
         # - 解决方案：我们弹出一个非阻塞的、带有动态旋转进度条和执行状态文本的现代 HUD 面板。
         if action_type == "folder-copy":
+            self._dock_pause()
             hud = ctk.CTkToplevel(self)
             hud.title("正在同步复制")
             hud.geometry("320x150")
@@ -1499,6 +3071,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             hud.configure(fg_color=self._t("background"))
             hud.transient(self)
             hud.grab_set()
+            self._bind_dock_modal(hud)
 
             # 居中子标签
             ctk.CTkLabel(hud, text="📂 正在同步覆盖目标文件...",
@@ -1531,10 +3104,14 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 def _done():
                     progress.stop()
                     hud.destroy()
-                    if review["status"] == "ready":
-                        messagebox.showinfo("同步成功", f"🎉 {card['title']} 执行成功！\n\n- 状态: 已完成\n- 详情: {review['summary']}", parent=self)
-                    else:
-                        messagebox.showerror("同步失败", f"❌ {card['title']} 执行失败！\n\n- 失败原因: {review['summary']}", parent=self)
+                    self._dock_pause()
+                    try:
+                        if review["status"] == "ready":
+                            messagebox.showinfo("同步成功", f"🎉 {card['title']} 执行成功！\n\n- 状态: 已完成\n- 详情: {review['summary']}", parent=self)
+                        else:
+                            messagebox.showerror("同步失败", f"❌ {card['title']} 执行失败！\n\n- 失败原因: {review['summary']}", parent=self)
+                    finally:
+                        self._dock_resume()
                     self._on_execute_done(card["title"], review)
 
                 hud.after(1000, _done)
@@ -1543,6 +3120,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             return
 
         self._set_status(f"正在执行: {card['title']}...", "warning")
+        self._dock_pause()
         self.update_idletasks()
 
         def _run():
@@ -1589,6 +3167,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         level = "success" if review["status"] == "ready" else "danger"
         self._toast(review["summary"], level)
         self._set_status(review["summary"], review["status"])
+        self._dock_resume()
 
     # ============================================================
     # 动作配置对话框核心渲染函数（抽离出的公用组件）
@@ -1656,14 +3235,18 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             if f["browse"] != "text":
                 def _browse(k=f["key"], kind=f["browse"]):
-                    if kind == "folder":
-                        p = filedialog.askdirectory(parent=container.winfo_toplevel())
-                    elif kind == "exe_lnk":
-                        p = filedialog.askopenfilename(parent=container.winfo_toplevel(),
-                                                        filetypes=[("可执行程序与快捷方式", "*.exe;*.lnk"), ("所有文件", "*.*")])
-                    else:
-                        p = filedialog.askopenfilename(parent=container.winfo_toplevel(),
-                                                        filetypes=[("批处理", "*.bat;*.cmd"), ("所有文件", "*.*")])
+                    self._dock_pause()
+                    try:
+                        if kind == "folder":
+                            p = filedialog.askdirectory(parent=container.winfo_toplevel())
+                        elif kind == "exe_lnk":
+                            p = filedialog.askopenfilename(parent=container.winfo_toplevel(),
+                                                            filetypes=[("可执行程序与快捷方式", "*.exe;*.lnk"), ("所有文件", "*.*")])
+                        else:
+                            p = filedialog.askopenfilename(parent=container.winfo_toplevel(),
+                                                            filetypes=[("批处理", "*.bat;*.cmd"), ("所有文件", "*.*")])
+                    finally:
+                        self._dock_resume()
                     if p:
                         param_vars[k].set(p)
 
@@ -1695,6 +3278,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
+        self._bind_dock_modal(dialog)
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
                      text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
@@ -1731,7 +3315,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             review_text.configure(state="disabled")
 
         def _do_delete():
-            if not messagebox.askyesno("确认删除", f"删除「{qa['title']}」？", parent=dialog):
+            self._dock_pause()
+            try:
+                confirmed = messagebox.askyesno("确认删除", f"删除「{qa['title']}」？", parent=dialog)
+            finally:
+                self._dock_resume()
+            if not confirmed:
                 return
             self.quick_actions = [a for a in self.quick_actions if a["id"] != qa["id"]]
             self._save_quick_actions()
@@ -1790,6 +3379,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
+        self._bind_dock_modal(dialog)
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
                      text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
@@ -1804,7 +3394,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         param_vars = self._render_config_fields(fields_container, module.module_type, module.params)
 
         def _delete():
-            if not messagebox.askyesno("确认删除", f"删除「{module.name}」？", parent=dialog):
+            self._dock_pause()
+            try:
+                confirmed = messagebox.askyesno("确认删除", f"删除「{module.name}」？", parent=dialog)
+            finally:
+                self._dock_resume()
+            if not confirmed:
                 return
             self.custom_modules = [m for m in self.custom_modules if m.module_id != module.module_id]
             self.module_storage.save(self.custom_modules)
@@ -1846,6 +3441,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         dialog.configure(fg_color=self._t("background"))
         dialog.transient(self)
         dialog.grab_set()
+        self._bind_dock_modal(dialog)
 
         ctk.CTkLabel(dialog, text="名称", font=ctk.CTkFont(family=FONT, size=12),
                      text_color=self._t("secondary")).pack(anchor="w", padx=16, pady=(16, 4))
@@ -1988,6 +3584,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         guide.configure(fg_color=self._t("background"))
         guide.transient(self)
         guide.grab_set()
+        self._bind_dock_modal(guide)
 
         ctk.CTkLabel(guide, text="✨ 欢迎使用 AiTool 生产力助手 ✨",
                      font=ctk.CTkFont(family=FONT, size=13, weight="bold"),

@@ -60,7 +60,11 @@ LIGHT_THEME_TOKENS: Final[dict[str, object]] = {
     "progress": "#6558d3",
     "toast": "#182033",
     "action_icon": "#6558d3",
+    "add_button": "#3b82f6",
+    "add_button_hover": "#2563eb",
+    "add_button_text": "#ffffff",
     "action_icon_by_kind": _LIGHT_ACTION_ICON_BY_KIND,
+    "pin_text": "#182033",
 }
 
 DARK_THEME_TOKENS: Final[dict[str, object]] = {
@@ -89,7 +93,11 @@ DARK_THEME_TOKENS: Final[dict[str, object]] = {
     "progress": "#7c6ef0",
     "toast": "#2a2b42",
     "action_icon": "#7c6ef0",
+    "add_button": "#60a5fa",
+    "add_button_hover": "#3b82f6",
+    "add_button_text": "#ffffff",
     "action_icon_by_kind": _DARK_ACTION_ICON_BY_KIND,
+    "pin_text": "#f0f1f8",
 }
 
 THEME_TOKENS: Final[dict[EffectiveTheme, dict[str, object]]] = {
@@ -175,6 +183,24 @@ def resolve_theme_mode(
     return _effective_theme(selected)
 
 
+def toggle_theme_mode(
+    mode: object = "system",
+    system_effective: object = SYSTEM_EFFECTIVE_THEME,
+    *,
+    system_theme: object | None = None,
+) -> ThemeMode:
+    """Return the explicit mode on the other side of the light/dark toggle.
+
+    A ``system`` startup preference remains supported, but an intentional click
+    on the in-app switch becomes an explicit choice.  Resolving first means a
+    system-light startup switches to dark and a system-dark startup switches to
+    light, without changing the startup resolver's compatibility behavior.
+    """
+
+    effective = resolve_theme_mode(mode, system_effective, system_theme=system_theme)
+    return "light" if effective == "dark" else "dark"
+
+
 resolve_theme = resolve_theme_mode
 effective_theme = resolve_theme_mode
 
@@ -207,6 +233,7 @@ __all__ = [
     "parse_theme_mode",
     "parse_theme_mode_strict",
     "resolve_theme_mode",
+    "toggle_theme_mode",
     "resolve_theme",
     "effective_theme",
     "theme_tokens",

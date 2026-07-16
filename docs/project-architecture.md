@@ -35,9 +35,12 @@ run_desktop_tool.py  # PyInstaller 入口
 docs/
   master-controller-handbook.md  # 主控手册（轻量版）
   project-architecture.md        # 本文档
+  windows-docking-lessons.md      # Windows Snap 隔离与顶部停靠经验
   version-plan.md                # 版本计划
   delivery-acceptance.md         # 交付验收标准
 ```
+
+Windows 原生窗口样式、Snap 隔离和顶部停靠的实现判断见[专项经验文档](windows-docking-lessons.md)。
 
 ## 4. 入口
 

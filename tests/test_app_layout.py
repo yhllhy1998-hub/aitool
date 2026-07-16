@@ -160,6 +160,11 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("parse_theme_mode(", APP_SOURCE)
         self.assertIn("resolve_theme_mode(", APP_SOURCE)
         self.assertIn("theme_tokens(", APP_SOURCE)
+        self.assertIn("toggle_theme_mode(", APP_SOURCE)
+        self.assertIn("def _toggle_theme", APP_SOURCE)
+        self.assertIn("def _refresh_theme", APP_SOURCE)
+        self.assertIn("self.btn_theme", _method_source("_build_station_area"))
+        self.assertIn("command=self._toggle_theme", _method_source("_build_station_area"))
         self.assertIn("ctk.set_appearance_mode(self.effective_theme)", APP_SOURCE)
         self.assertIn("self._tokens", APP_SOURCE)
 
@@ -174,6 +179,46 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("def _quit_from_tray", APP_SOURCE)
         self.assertIn("self.quit()", _method_source("_quit_from_tray"))
         self.assertIn("self.after(0, self._quit_from_tray)", APP_SOURCE)
+
+    def test_native_titlebar_configure_is_isolated_from_dock_animation(self) -> None:
+        save = _method_source("_schedule_geometry_save")
+        self.assertIn('self.bind("<Configure>", self._schedule_geometry_save, add="+")', APP_SOURCE)
+        self.assertIn("self._begin_native_titlebar_interaction(", save)
+        self.assertIn("self._cancel_dock_jobs()", _method_source("_begin_native_titlebar_interaction"))
+        self.assertIn("self._cancel_dock_animation()", _method_source("_cancel_dock_jobs"))
+
+    def test_native_snap_state_and_size_change_block_top_dock(self) -> None:
+        observe = _method_source("_observe_window_position")
+        self.assertIn('"zoomed", "maximized"', _method_source("_window_is_maximized"))
+        self.assertIn("self._dock_native_size_changed", observe)
+        self.assertIn("self._DOCK_SIZE_CHANGE_THRESHOLD", observe)
+        self.assertIn("self._dock_resize_blocked", observe)
+
+    def test_native_style_is_applied_after_titlebar_is_kept_and_before_configure_binding(self) -> None:
+        init = _method_source("_init_window")
+        self.assertIn("self.overrideredirect(False)", init)
+        self.assertIn("self.update_idletasks()", init)
+        self.assertIn("self._apply_native_window_style_once()", init)
+        self.assertIn('self.bind("<Configure>", self._schedule_geometry_save, add="+")', init)
+        self.assertLess(
+            init.index("self.overrideredirect(False)"),
+            init.index("self._apply_native_window_style_once()"),
+        )
+        self.assertLess(
+            init.index("self._apply_native_window_style_once()"),
+            init.index('self.bind("<Configure>", self._schedule_geometry_save'),
+        )
+
+    def test_programmatic_configure_ack_and_native_quiet_timer_are_explicit(self) -> None:
+        setter = _method_source("_set_window_geometry")
+        self.assertIn("self._cancel_native_titlebar_interaction()", setter)
+        self.assertIn("self._dock_expected_geometry = geometry", setter)
+        self.assertIn("self._dock_expected_outer_position", setter)
+
+        configure = _method_source("_schedule_geometry_save")
+        self.assertIn("self._configure_matches_expected_geometry(", configure)
+        self.assertIn("self._clear_expected_geometry()", configure)
+        self.assertIn("self._arm_native_titlebar_quiet_timer", configure)
 
     def test_disabled_theme_tokens_are_used_for_native_textbox(self) -> None:
         source = _method_source("_configure_disabled_textbox")

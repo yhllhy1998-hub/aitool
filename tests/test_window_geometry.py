@@ -15,6 +15,8 @@ if str(SRC) not in sys.path:
 
 from aitool_desktop.window_geometry import (  # noqa: E402
     DEFAULT_GEOMETRY,
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
     MAX_WINDOW_DIMENSION,
     MIN_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH,
@@ -34,6 +36,10 @@ from aitool_desktop.window_geometry import (  # noqa: E402
 
 
 class WindowGeometryTests(unittest.TestCase):
+    def test_first_run_default_retains_original_narrow_size(self) -> None:
+        self.assertEqual((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT), (360, 580))
+        self.assertEqual(DEFAULT_GEOMETRY, WindowGeometry(0, 0, 360, 580))
+
     def test_v1_round_trip_and_exact_schema(self) -> None:
         geometry = WindowGeometry(-120, 50, 800, 600)
         payload = json.loads(serialize_window_geometry(geometry))
@@ -67,17 +73,22 @@ class WindowGeometryTests(unittest.TestCase):
         self.assertIs(select_work_area(saved, [left, right]), left)
         self.assertEqual(place_window_geometry(saved, [left, right]), saved)
 
+    def test_saved_geometry_from_wider_version_is_restored_unchanged(self) -> None:
+        area = WorkArea(0, 0, 1920, 1080)
+        saved = WindowGeometry(40, 60, 760, 760)
+        self.assertEqual(place_window_geometry(saved, [area]), saved)
+
     def test_default_geometry_centers_on_a_work_area(self) -> None:
         primary = WorkArea(-1920, 80, 0, 1160)
         self.assertEqual(
             default_geometry(primary),
-            WindowGeometry(-1340, 240, 760, 760),
+            WindowGeometry(-1140, 330, 360, 580),
         )
 
     def test_missing_or_invalid_geometry_uses_primary_and_centers_default(self) -> None:
         primary = WorkArea(0, 0, 1920, 1080)
         left = WorkArea(-1920, 0, 0, 1080)
-        expected = WindowGeometry(580, 160, 760, 760)
+        expected = WindowGeometry(780, 250, 360, 580)
         self.assertEqual(place_window_geometry(None, [left, primary], primary_index=1), expected)
         self.assertEqual(
             place_window_geometry({"x": "bad"}, [left, primary], primary_index=1),
@@ -86,7 +97,7 @@ class WindowGeometryTests(unittest.TestCase):
 
         self.assertEqual(
             place_window_geometry(None, [left, primary], primary_index=0),
-            WindowGeometry(-1340, 160, 760, 760),
+            WindowGeometry(-1140, 250, 360, 580),
         )
 
     def test_mapping_placement_requires_strict_v1_payload(self) -> None:
@@ -104,7 +115,7 @@ class WindowGeometryTests(unittest.TestCase):
     def test_load_and_place_invalid_files_use_primary_centered_default(self) -> None:
         first = WorkArea(0, 0, 1920, 1080)
         negative_primary = WorkArea(-1920, -100, 0, 980)
-        expected = WindowGeometry(-1340, 60, 760, 760)
+        expected = WindowGeometry(-1140, 150, 360, 580)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "geometry.json"
@@ -156,7 +167,7 @@ class WindowGeometryTests(unittest.TestCase):
 
     def test_size_is_limited_before_position_and_small_work_area_is_allowed(self) -> None:
         area = WorkArea(-500, -300, 0, 0)
-        placed = place_window_geometry(WindowGeometry(-999, -999, 20_000, 20_000), [area])
+        placed = place_window_geometry(WindowGeometry(-999, -999, MAX_WINDOW_DIMENSION, MAX_WINDOW_DIMENSION), [area])
         self.assertEqual(placed, WindowGeometry(-500, -300, area.width, area.height))
 
         normal = WorkArea(0, 0, 1600, 900)
