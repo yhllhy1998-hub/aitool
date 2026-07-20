@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import weakref
@@ -53,25 +54,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-GWL_STYLE = -16
-WS_THICKFRAME = 0x00040000
-WS_SIZEBOX = 0x00040000
-WS_MAXIMIZEBOX = 0x00010000
-WS_CAPTION = 0x00C00000
-WS_SYSMENU = 0x00080000
-WS_MINIMIZEBOX = 0x00020000
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
 GA_ROOT = 2
-
-# LONG_PTR is a signed pointer-sized value.  Do not use ctypes' default
-# ``c_int`` for Get/SetWindowLongPtrW: that truncates the value on 64-bit
-# Windows and can make a successful-looking style update a no-op.
-_LONG_PTR = ctypes.c_int64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_int32
-_NATIVE_STYLE_MASK = WS_THICKFRAME | WS_SIZEBOX | WS_MAXIMIZEBOX
 
 
 def _resolve_native_window_hwnd(tk_hwnd: int) -> int:
@@ -80,8 +67,8 @@ def _resolve_native_window_hwnd(tk_hwnd: int) -> int:
     On Windows, ``winfo_id()`` for a Tk/CustomTkinter root is not necessarily
     the HWND which owns the native caption.  CustomTkinter itself resolves
     this relationship with ``GetParent(self.winfo_id())`` before calling DWM.
-    Applying ``GWL_STYLE`` to the Tk client HWND consequently leaves the
-    visible top-level frame unchanged.  ``GetAncestor(GA_ROOT)`` is the more
+    Native positioning and frame queries must target the visible top-level
+    HWND rather than the Tk client HWND.  ``GetAncestor(GA_ROOT)`` is the more
     explicit form and also handles a Tk build with an intermediate parent;
     the GetParent fallback keeps this compatible with older Windows/Tk builds.
     """
@@ -90,6 +77,7 @@ def _resolve_native_window_hwnd(tk_hwnd: int) -> int:
     if os.name != "nt" or not candidate:
         return candidate
 
+    resolution_error = None
     try:
         user32 = ctypes.windll.user32
 
@@ -121,15 +109,14 @@ def _resolve_native_window_hwnd(tk_hwnd: int) -> int:
                 )
                 return parent_hwnd
     except Exception as exc:
-        logger.debug(
-            "native root HWND resolution failed for Tk HWND %#x: %s",
-            candidate,
-            exc,
-        )
+        resolution_error = exc
 
     # If the relationship cannot be queried, retain the original handle so
     # the verified API path can still be used by non-Windows/headless tests.
-    logger.debug("using Tk HWND %#x as native style target", candidate)
+    method = "fallback"
+    if resolution_error is not None:
+        method = f"fallback after {type(resolution_error).__name__}"
+    logger.debug("using Tk HWND %#x as visible native target (%s)", candidate, method)
     return candidate
 
 
@@ -185,138 +172,6 @@ def _set_native_window_position(hwnd: int, x: int, y: int) -> bool:
         return succeeded
     except Exception as exc:
         logger.debug("native window position update skipped: %s", exc)
-        return False
-
-
-def _disable_native_resize_and_maximize(hwnd: int) -> bool:
-    """Keep the native title bar while removing Win32 resize/Snap affordances.
-
-    This is deliberately a verified operation.  ``SetWindowLongPtrW`` can
-    return a value that only describes the previous style, while
-    ``SetWindowPos`` only refreshes the non-client frame.  Both calls and a
-    second ``GetWindowLongPtrW`` are therefore required before returning true.
-    """
-
-    if os.name != "nt" or not hwnd:
-        return False
-
-    try:
-        user32 = ctypes.windll.user32
-        get_window_long_ptr = user32.GetWindowLongPtrW
-        set_window_long_ptr = user32.SetWindowLongPtrW
-        set_window_pos = user32.SetWindowPos
-
-        get_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
-        get_window_long_ptr.restype = _LONG_PTR
-        set_window_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, _LONG_PTR]
-        set_window_long_ptr.restype = _LONG_PTR
-        set_window_pos.argtypes = [
-            wintypes.HWND,
-            wintypes.HWND,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint,
-        ]
-        set_window_pos.restype = wintypes.BOOL
-
-        tk_hwnd = int(hwnd)
-        native_hwnd_value = _resolve_native_window_hwnd(tk_hwnd)
-        if not native_hwnd_value:
-            logger.warning("no visible native HWND resolved from Tk HWND %#x", tk_hwnd)
-            return False
-
-        # Convert the visible top-level handle through the declared HWND type
-        # explicitly so this remains correct for a 64-bit frozen process as
-        # well as for a 32-bit Python process.
-        native_hwnd = wintypes.HWND(native_hwnd_value)
-        style_mask = WS_THICKFRAME | WS_SIZEBOX | WS_MAXIMIZEBOX
-
-        def _as_long_ptr_value(value) -> int:
-            return int(getattr(value, "value", value))
-
-        style_before = _as_long_ptr_value(get_window_long_ptr(native_hwnd, GWL_STYLE))
-        if not style_before:
-            logger.warning(
-                "GetWindowLongPtrW returned no style for visible HWND %#x (Tk HWND %#x)",
-                native_hwnd_value,
-                tk_hwnd,
-            )
-            return False
-
-        desired_style = (style_before & ~style_mask) | (
-            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
-        )
-        previous_style = _as_long_ptr_value(
-            set_window_long_ptr(native_hwnd, GWL_STYLE, _LONG_PTR(desired_style))
-        )
-        # For a real Tk top-level, the old style is non-zero.  A zero return
-        # therefore indicates that SetWindowLongPtrW did not update this HWND;
-        # do not report success based only on SetWindowPos in that case.
-        if not previous_style:
-            logger.warning(
-                "SetWindowLongPtrW failed for visible HWND %#x (Tk HWND %#x)",
-                native_hwnd_value,
-                tk_hwnd,
-            )
-            return False
-
-        style_after_set = _as_long_ptr_value(get_window_long_ptr(native_hwnd, GWL_STYLE))
-        if style_after_set & style_mask:
-            logger.warning(
-                "native style still has resize/maximize bits after SetWindowLongPtrW: %#x",
-                style_after_set,
-            )
-            return False
-
-        frame_changed = bool(
-            set_window_pos(
-                native_hwnd,
-                wintypes.HWND(0),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE
-                | SWP_NOSIZE
-                | SWP_NOZORDER
-                | SWP_NOACTIVATE
-                | SWP_FRAMECHANGED,
-            )
-        )
-        if not frame_changed:
-            logger.warning(
-                "SetWindowPos(SWP_FRAMECHANGED) failed for visible HWND %#x (Tk HWND %#x)",
-                native_hwnd_value,
-                tk_hwnd,
-            )
-            return False
-
-        # Tk can adjust the frame while the toplevel is first mapped.  Read it
-        # again after FRAMECHANGED so callers never mistake an API call for a
-        # verified style change.
-        style_after_frame_change = _as_long_ptr_value(
-            get_window_long_ptr(native_hwnd, GWL_STYLE)
-        )
-        if style_after_frame_change & style_mask:
-            logger.warning(
-                "native style verification failed for HWND %#x: %#x",
-                native_hwnd_value,
-                style_after_frame_change,
-            )
-            return False
-        logger.debug(
-            "native resize/maximize style disabled for HWND %#x: %#x -> %#x",
-            native_hwnd_value,
-            style_before,
-            style_after_frame_change,
-        )
-        return True
-    except Exception as exc:
-        # Tk/headless test environments and restricted Windows sessions may
-        # not expose a usable HWND.  The normal Tk title bar remains usable.
-        logger.debug("native window style update skipped: %s", exc)
         return False
 
 
@@ -414,6 +269,41 @@ def _startup_theme_mode(environ=None):
 
     environment = os.environ if environ is None else environ
     return parse_theme_mode(environment.get("AITOOL_THEME", "dark"), fallback="dark")
+
+
+def _configure_startup_appearance() -> None:
+    """Lock the CustomTkinter appearance mode before any Tk root widget is created.
+
+    CustomTkinter reads the appearance mode once when a ``CTk`` root is first
+    constructed.  Calling ``ctk.set_appearance_mode`` after ``super().__init__()``
+    in ``DesktopToolApp`` produces a visible flash: the root and every native
+    ``Label`` widget are initially painted with the default light palette and
+    then retinted on the next event-loop tick.
+
+    This function must run at **module level**, before ``DesktopToolApp`` is
+    instantiated.  It uses the same ``_startup_theme_mode()`` /
+    ``_detect_system_effective_theme()`` / ``resolve_theme_mode()`` pipeline as
+    the ``__init__`` assignments and does **not** depend on any Tk root, window,
+    or event loop — only on ``os.environ``, the Windows registry (via
+    ``winreg``), and a ``ctypes`` fallback.
+    """
+
+    try:
+        theme_mode = _startup_theme_mode()
+        effective = resolve_theme_mode(
+            theme_mode,
+            system_theme=_detect_system_effective_theme(),
+        )
+        ctk.set_appearance_mode(effective)
+        logger.debug("startup appearance configured: %s", effective)
+    except Exception:
+        # A failed probe must never produce a partially initialized palette.
+        # Fall back to the same deterministic dark default the resolver uses.
+        ctk.set_appearance_mode("dark")
+        logger.exception("startup appearance configuration failed; falling back to dark")
+
+
+_configure_startup_appearance()
 
 
 def _get_windows_work_areas(host) -> tuple[list[WorkArea], int]:
@@ -552,33 +442,6 @@ QUICK_ACTION_DEFS = [
 
 def _load_json(path: Path, fallback):
     if not path.exists():
-        # 极重要：如果是第一次打包或部署，将当前拥有的高品质双路径覆盖和 Jenkins 动作作为系统最高优先级的出厂默认配置！
-        # 从而保证其他人双击打开 exe 就能立刻看到开箱即用的“双通道资源覆盖”和“Jenkins”两个漂亮的默认模块
-        if "custom_modules" in str(path):
-            return {
-              "updated_at": "2026-07-10T16:55:00+08:00",
-              "modules": [
-                {
-                  "module_id": "589d70dab9da",
-                  "name": "Jenkins",
-                  "module_type": "open-web",
-                  "params": {
-                    "url": "http://192.168.1.192:8080/view/%E4%BF%A1%E9%95%BF_trunk/job/All-%E4%BF%A1%E9%95%BF-04.%E5%90%8C%E6%AD%A5%E9%85%8D%E7%BD%AE%E5%88%B0Unity%E5%B7%A5%E7%A8%8B_trunk/"
-                  }
-                },
-                {
-                  "module_id": "multi-folder-copy-001",
-                  "name": "双通道资源覆盖",
-                  "module_type": "folder-copy",
-                  "params": {
-                    "source": "F:/F_tunk/resource/script/autocode",
-                    "target": "F:/cehua/test",
-                    "source2": "F:/F_tunk/ExcelRoot/Out/LuaFile",
-                    "target2": "D:/JP_project/Project_P1/LuaCode/DB/Data"
-                  }
-                }
-              ]
-            }
         return fallback
     try:
         import json
@@ -797,18 +660,17 @@ class WindowsIconCache:
 class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self) -> None:
         super().__init__()
+        self._shutdown_started = False
+        logger.info("DesktopToolApp initialization started")
         self.theme_mode = _startup_theme_mode()
         self.effective_theme = resolve_theme_mode(
             self.theme_mode,
             system_theme=_detect_system_effective_theme(),
         )
         self._tokens = theme_tokens(self.effective_theme)
-        ctk.set_appearance_mode(self.effective_theme)
         self.TkdndVersion = TkinterDnD._require(self)
         self._geometry_save_job = None
         self._geometry_restoring = True
-        self._native_window_style_applied = False
-        self._native_window_style_reapply_scheduled = False
         # Docking is deliberately separate from ``_pinned``.  The latter is
         # only the Windows Z-order preference; these fields describe the
         # temporary top-edge drawer transition.
@@ -842,12 +704,19 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._expanded_geometry: WindowGeometry | None = None
         self._tray_restore_was_docked = False
         self._tray_hidden = False
+        self._tray_thread = None
+        self._tray_startup_enabled = False
+        self._tray_dispatch_queue = queue.Queue()
+        self._tray_dispatch_job = None
+        self._tray_shutdown_event = threading.Event()
         self._dock_handle_height = 30
         self._init_storage()
         self._init_window()
         self._build_ui()
         self._refresh_all()
+        self.update_idletasks()
         self.after_idle(self._finish_geometry_restore)
+        self._tray_dispatch_job = self.after(50, self._poll_tray_dispatch_queue)
 
         try:
             self.drop_target_register(DND_FILES, DND_TEXT)
@@ -859,6 +728,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             _record_dnd_registration("target", self, True)
         except Exception as exc:
             _record_dnd_registration("target", self, False, exc)
+        logger.info("DesktopToolApp initialization completed")
 
     def _t(self, name: str):
         """Resolve a visual token from the single startup palette."""
@@ -872,7 +742,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.effective_theme = resolve_theme_mode(self.theme_mode)
         self._refresh_theme()
 
-    def _refresh_theme(self) -> None:
+    def _refresh_theme(self, announce: bool = True) -> None:
         """Apply the selected token palette to the complete main window.
 
         Most of the existing UI intentionally passes concrete token values to
@@ -893,6 +763,37 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         for widget in tuple(self.winfo_children()):
             self._retint_widget_tree(widget, old_tokens)
 
+        if hasattr(self, "content"):
+            self.content.configure(
+                fg_color=self._t("background"),
+                bg_color=self._t("background"),
+            )
+        if hasattr(self, "_height_resize_grip"):
+            self._height_resize_grip.configure(
+                fg_color=self._t("surface"),
+                bg_color=self._t("background"),
+            )
+
+        if hasattr(self, "statusbar"):
+            self.statusbar.configure(
+                fg_color=self._t("surface"),
+                bg_color=self._t("surface"),
+            )
+            self.status_dot.configure(
+                bg_color=self._t("surface"),
+                fg_color="transparent",
+                text_color=self._t("success"),
+            )
+            self.status_label.configure(
+                bg_color=self._t("surface"),
+                fg_color="transparent",
+                text_color=self._t("secondary"),
+            )
+        if hasattr(self, "_dock_handle"):
+            self._dock_handle.configure(
+                fg_color=self._t("surface"),
+                bg_color=self._t("surface"),
+            )
         if hasattr(self, "_dock_handle_label"):
             self._dock_handle_label.configure(bg=self._t("surface"))
             self._draw_dock_handle_icon()
@@ -925,7 +826,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 self._actions_canvas.yview_moveto(actions_view[0])
 
         self.after_idle(restore_scroll_positions)
-        self._set_status(f"已切换至{'亮色' if self.effective_theme == 'light' else '暗色'}主题", "ready")
+        if announce:
+            self._set_status(f"已切换至{'亮色' if self.effective_theme == 'light' else '暗色'}主题", "ready")
 
     def _retint_widget_tree(self, widget, old_tokens: dict[str, object]) -> None:
         """Update token-backed options on CustomTkinter and native Tk widgets."""
@@ -968,6 +870,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._retint_widget_tree(child, old_tokens)
 
     def _finish_geometry_restore(self) -> None:
+        if getattr(self, "_shutdown_started", False):
+            logger.debug("geometry restore completion skipped during shutdown")
+            return
         self._geometry_restoring = False
         self._dock_restore_blocked = False
         self._clear_expected_geometry()
@@ -1018,18 +923,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             return False
 
     def _native_resize_capability_available(self) -> bool:
-        """Return whether a native resize can still own Configure events.
+        """Return whether the normal native title bar can own Configure events."""
 
-        Once the visible frame style has been verified, this app no longer
-        exposes native resize/Snap affordances.  A size change observed before
-        that verification is kept behind the conservative resize fence; a
-        verified non-resizable frame only needs the short native quiet period.
-        Non-Windows/headless runs have no native resize owner either.
-        """
-
-        return os.name == "nt" and not bool(
-            getattr(self, "_native_window_style_applied", False)
-        )
+        return os.name == "nt"
 
     def _cancel_native_titlebar_interaction(self) -> None:
         self._cancel_dock_job("_dock_native_interaction_job")
@@ -1500,11 +1396,10 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 not self._native_resize_capability_available()
                 and abs(outer_top - area.top) <= self._DOCK_EDGE_THRESHOLD
             ):
-                # A verified non-resizable normal frame has no native resize
-                # owner left after the quiet timer.  Do not let a size-change
-                # fence permanently suppress a top-edge observation.  The
-                # maximized case returned above and a move away from the edge
-                # retain their existing protection semantics.
+                # A non-native frame has no resize owner left after the quiet
+                # timer.  Do not let a size-change fence permanently suppress
+                # a top-edge observation.  The maximized case returned above
+                # and a move away from the edge retain their protection.
                 self._dock_resize_blocked = False
             else:
                 self._cancel_dock_job("_dock_debounce_job")
@@ -1646,6 +1541,17 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._dock_animation_job = self.after(self._DOCK_ANIMATION_STEP_MS, _tick)
 
     def _request_dock_collapse(self) -> None:
+        logger.info(
+            "dock collapse requested: dock_state=%s tray_hidden=%s pause_count=%s "
+            "native_interaction=%s resize_blocked=%s",
+            self._dock_state,
+            getattr(self, "_tray_hidden", False),
+            self._dock_pause_count,
+            self._dock_native_interaction,
+            self._dock_resize_blocked,
+        )
+        if getattr(self, "_shutdown_started", False):
+            return
         if (
             self._dock_state != "docked_expanded"
             or self._dock_pause_count
@@ -1664,6 +1570,14 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
 
     def _request_dock_expand(self) -> None:
+        logger.info(
+            "dock expand requested: dock_state=%s tray_hidden=%s pause_count=%s",
+            self._dock_state,
+            getattr(self, "_tray_hidden", False),
+            self._dock_pause_count,
+        )
+        if getattr(self, "_shutdown_started", False):
+            return
         if self._dock_state not in ("collapsed", "collapsing", "expanding"):
             return
         area = self._dock_work_area or self._dock_area_for_geometry(self._expanded_geometry)
@@ -1678,6 +1592,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._dock_state != "docked_expanded"
             or self._dock_modal_present()
             or self._dock_native_interaction
+            or getattr(self, "_height_resizing", False)
             or self._window_is_maximized()
         ):
             return
@@ -1689,6 +1604,10 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         if self._dock_state != "docked_expanded" or self._window_is_maximized():
             return
 
+        if getattr(self, "_height_resizing", False):
+            self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
+            return
+
         # Native Configure events temporarily own geometry.  Do not collapse
         # against that owner, but do keep polling; otherwise the one-shot timer
         # is lost while a native interaction is settling.
@@ -1696,9 +1615,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._dock_autohide_job = self.after(250, self._autohide_if_pointer_left)
             return
 
-        # Once the quiet period has ended, a verified non-resizable normal
-        # frame cannot still have a real native resize owner.  Clear only this
-        # stale fence while the drawer is already docked and expanded; the
+        # Once the quiet period has ended, clear this stale fence only when
+        # there is no native resize owner while the drawer is already docked;
         # maximized case returned above and native interaction case above keep
         # their protection semantics.
         if self._dock_resize_blocked:
@@ -1750,8 +1668,29 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         if not hasattr(self, "_dock_handle"):
             return
         self._dock_handle.place_forget()
-        self.status_dot.grid()
-        self.status_label.grid()
+        self.status_dot.grid(row=0, column=0, padx=(SPACING["md"], SPACING["xs"]))
+        self.status_label.grid(row=0, column=1, sticky="w")
+        self._refresh_statusbar_labels()
+
+    def _refresh_statusbar_labels(self) -> None:
+        """Reassert background/fg colours on the two statusbar CTkLabels.
+
+        After a grid_remove/grid round-trip the internal native Tk Label can
+        lose its custom colour overrides and briefly flash the default system
+        background (the "white block" bug).  Calling this after restoring the
+        labels prevents the flash without overwriting the semantic text_colour
+        managed by :meth:`_set_status` and :meth:`_refresh_theme`.
+        """
+        if not hasattr(self, "status_dot") or not hasattr(self, "status_label"):
+            return
+        self.status_dot.configure(
+            bg_color=self._t("surface"),
+            fg_color="transparent",
+        )
+        self.status_label.configure(
+            bg_color=self._t("surface"),
+            fg_color="transparent",
+        )
 
     def _register_dock_handle_dnd(self) -> None:
         """Register the visible handle as a full DND_FILES/DND_TEXT target."""
@@ -1890,23 +1829,31 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _ensure_default_config(self) -> None:
         """首次运行时，从打包内置的 data 目录复制默认配置到用户持久化目录 (APPDATA)。"""
-        if DATA_DIR.exists() and any(DATA_DIR.iterdir()):
-            return
         builtin_data = REPO_ROOT / "data"
         if not builtin_data.exists():
             return
         import shutil
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        for src in builtin_data.iterdir():
+        for filename in (
+            "quick_actions.json",
+            "custom_modules.json",
+            "document_station_entries.json",
+        ):
+            src = builtin_data / filename
             dst = DATA_DIR / src.name
-            if not dst.exists():
+            if src.exists() and not dst.exists():
                 shutil.copy2(src, dst)
 
     def _load_quick_actions(self) -> list[dict]:
-        data = _load_json(QUICK_ACTIONS_PATH, {})
-        actions = data.get("actions", []) if isinstance(data, dict) else []
-        if actions:
-            return actions
+        data = _load_json(QUICK_ACTIONS_PATH, None)
+        if isinstance(data, dict) and isinstance(data.get("actions"), list):
+            return data["actions"]
+
+        builtin_path = REPO_ROOT / "data" / "quick_actions.json"
+        data = _load_json(builtin_path, None)
+        if isinstance(data, dict) and isinstance(data.get("actions"), list):
+            return data["actions"]
+
         return [dict(a) for a in QUICK_ACTION_DEFS]
 
     def _save_quick_actions(self) -> None:
@@ -1939,9 +1886,9 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             } else self._current_window_geometry()
             if candidate is None:
                 return
-            # The native frame is intentionally non-resizable horizontally.
-            # Keep persisted geometry compatible with that contract even if a
-            # stale or foreign geometry object reaches this path.
+            # Keep persisted geometry compatible with the existing station
+            # layout contract even if a stale or foreign geometry object
+            # reaches this path.
             candidate = WindowGeometry(
                 candidate.x,
                 candidate.y,
@@ -1952,51 +1899,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception as exc:
             logger.debug("window geometry save skipped: %s", exc)
 
-    def _apply_native_window_style_once(self) -> bool:
-        """Apply the non-resizable native-frame contract once per visible HWND."""
 
-        if self._native_window_style_applied:
-            return True
-        try:
-            tk_hwnd = int(self.winfo_id())
-        except Exception as exc:
-            logger.debug("native window HWND unavailable: %s", exc)
-            return False
-        verified = _disable_native_resize_and_maximize(tk_hwnd)
-        if verified:
-            self._native_window_style_applied = True
-        return verified
-
-    def _reapply_native_window_style_after_map(self, _event=None) -> None:
-        """Verify the frame after Tk has displayed or remapped the toplevel.
-
-        Tk may recreate or adjust native frame styles while mapping a window.
-        The idle callback catches the initial startup race, while the Map
-        binding below also protects the same visible HWND after a tray
-        withdraw/deiconify cycle.  This remains independent of Configure
-        handling: it never rewrites the style on every geometry event.
-        """
-
-        try:
-            self.update_idletasks()
-            hwnd = int(self.winfo_id())
-            verified = _disable_native_resize_and_maximize(hwnd)
-            if verified:
-                self._native_window_style_applied = True
-        except Exception as exc:
-            logger.debug("post-map native window style verification skipped: %s", exc)
-
-    def _schedule_native_window_style_reapply(self) -> None:
-        """Schedule exactly one post-map style verification."""
-
-        if self._native_window_style_reapply_scheduled:
-            return
-        self._native_window_style_reapply_scheduled = True
-        try:
-            self.bind("<Map>", self._reapply_native_window_style_after_map, add="+")
-            self.after_idle(self._reapply_native_window_style_after_map)
-        except Exception as exc:
-            logger.debug("post-map native window style scheduling skipped: %s", exc)
 
     def _schedule_geometry_save(self, _event=None) -> None:
         if (
@@ -2074,16 +1977,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.attributes("-topmost", True)
         self._pinned = True
         self.overrideredirect(False)
-        # ``super().__init__`` has created the Tk toplevel by this point.  Flush
-        # pending window-manager work before querying its HWND, then update the
-        # native style before binding Configure so FRAMECHANGED cannot look like
-        # a user title-bar drag.
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
-        self._apply_native_window_style_once()
-        self._schedule_native_window_style_reapply()
 
         # 设置 Windows 任务栏和左上角的应用程序窗口图标，与托盘图标完美保持一致！
         try:
@@ -2098,12 +1991,10 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
         self.bind("<Configure>", self._schedule_geometry_save, add="+")
         self._tray_icon = None
+        self._tray_thread = None
 
         # 1. 默认并强力开启 Windows 开机自启动，确保出厂即常驻！
         self._setup_default_startup()
-
-        # 2. 绑定全局系统热键 Alt + A 来显示/隐藏窗口 (默认开启，优雅常驻)
-        self._setup_global_hotkey()
 
     def _setup_default_startup(self) -> None:
         """初次运行时自动将 AiTool 写入 Windows 开机自启动注册表，实现默认开启。"""
@@ -2131,26 +2022,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         except Exception:
             pass
 
-    def _setup_global_hotkey(self) -> None:
-        """在后台守护线程中注册全局系统热键 Alt + A，实现任何状态下一键呼出/隐藏主界面。"""
-        try:
-            import keyboard
-            
-            def _toggle_gui():
-                # 收起只是顶部停靠状态，不等同于托盘隐藏。
-                if self._tray_hidden or not self.winfo_viewable():
-                    self.after(0, self._restore_from_tray)
-                elif self._dock_state in ("collapsed", "collapsing", "expanding"):
-                    self.after(0, self._request_dock_expand)
-                else:
-                    # 保留原有契约：正常可见时 Alt+A 进入托盘。
-                    self.after(0, self._minimize_to_tray)
-
-            # 在后台注册全局热键 Alt + A / alt+a (忽略大小写)
-            keyboard.add_hotkey("alt+a", _toggle_gui, suppress=True)
-        except Exception:
-            pass
-
     def _get_startup_status(self) -> bool:
         """检查 Windows 注册表判定开机自启动是否已开启。"""
         try:
@@ -2174,6 +2045,8 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def _toggle_startup(self, icon=None, item=None) -> None:
         """开启或关闭 Windows 开机自启动注册表项。"""
+        if self._shutdown_started:
+            return
         import sys
         import winreg
         
@@ -2194,18 +2067,31 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if current_status:
                 # 已经开启，现在点击则是关闭
                 winreg.DeleteValue(key, "AiTool")
-                self.after(0, lambda: self._toast("已关闭开机自启动", "warning"))
+                callback = lambda: self._toast("已关闭开机自启动", "warning")
             else:
                 # 未开启，现在开启
                 winreg.SetValueEx(key, "AiTool", 0, winreg.REG_SZ, f'"{app_path}"')
-                self.after(0, lambda: self._toast("已成功开启开机自启动！", "success"))
+                callback = lambda: self._toast("已成功开启开机自启动！", "success")
             winreg.CloseKey(key)
+            self._tray_startup_enabled = not current_status
+            if not self._shutdown_started:
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("startup setting result dispatch failed")
         except Exception as exc:
-            self.after(0, lambda: self._toast(f"设置失败: {exc}", "danger"))
+            logger.exception("startup setting update failed")
+            if not self._shutdown_started:
+                try:
+                    self._toast(f"设置失败: {exc}", "danger")
+                except Exception:
+                    logger.exception("startup setting failure dispatch failed")
 
     def _show_settings_dialog(self, icon=None, item=None) -> None:
         """显示设置弹窗。为了保证在主窗口被隐藏（withdraw）时也能正常设置，在主线程中唤起设置弹窗。"""
         def _build_dialog():
+            if self._shutdown_started:
+                return
             self._cancel_dock_jobs()
             self._tray_hidden = False
             self.deiconify()
@@ -2218,7 +2104,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
             dialog = ctk.CTkToplevel(self)
             dialog.title("设置中心")
-            dialog.geometry("320x260") # 微调增高高度，为全局快捷键 Alt+A 标识提供排版空间
+            dialog.geometry("320x260")
             dialog.resizable(False, False)
             dialog.configure(fg_color=self._t("background"))
             dialog.transient(self)
@@ -2248,99 +2134,237 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                          font=ctk.CTkFont(family=FONT, size=9),
                          text_color=self._t("muted")).pack(pady=(0, 12))
 
-            # 增加全局快捷键的可视化展示
-            hotkey_lbl = ctk.CTkLabel(dialog, text="全局唤醒/隐藏快捷键：Alt + A",
-                                      font=ctk.CTkFont(family=FONT, size=11, weight="bold"),
-                                      text_color=self._t("focus"))
-            hotkey_lbl.pack(pady=4)
-
-            ctk.CTkLabel(dialog, text="Alt + A：展开 AiTool；已展开时再次按下可最小化到托盘",
-                         font=ctk.CTkFont(family=FONT, size=9),
-                         text_color=self._t("muted")).pack(pady=(0, 16))
-
             ctk.CTkButton(dialog, text="关闭设置", corner_radius=6,
                           fg_color=self._t("hover"), hover_color=self._t("elevated"),
                           text_color=self._t("text"), font=ctk.CTkFont(family=FONT, size=11),
                           command=dialog.destroy).pack(fill="x", padx=40)
 
-        self.after(0, _build_dialog)
+        if self._shutdown_started:
+            return
+        try:
+            _build_dialog()
+        except Exception:
+            logger.exception("settings dialog build failed")
+
+    def _cleanup_before_exit(self) -> None:
+        """Idempotently release callbacks, timers, tray resources, and native state."""
+
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        logger.info("shutdown cleanup started")
+
+        tray_dispatch_job = getattr(self, "_tray_dispatch_job", None)
+        self._tray_dispatch_job = None
+        if tray_dispatch_job is not None:
+            try:
+                self.after_cancel(tray_dispatch_job)
+                logger.info("tray dispatch poll cancelled")
+            except Exception:
+                logger.exception("tray dispatch poll cancellation failed")
+        tray_shutdown_event = getattr(self, "_tray_shutdown_event", None)
+        if tray_shutdown_event is not None:
+            tray_shutdown_event.set()
+
+        try:
+            self._cancel_geometry_save_job()
+            self._cancel_dock_jobs()
+            self._cancel_native_titlebar_interaction()
+        except Exception:
+            logger.exception("shutdown timer cleanup failed")
+
+        tray_icon = getattr(self, "_tray_icon", None)
+        tray_thread = getattr(self, "_tray_thread", None)
+        self._tray_icon = None
+        self._tray_thread = None
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+                logger.info(
+                    "tray icon stopped: thread_alive_before_join=%s",
+                    bool(tray_thread and tray_thread.is_alive()),
+                )
+            except Exception:
+                logger.exception("tray icon stop failed")
+        if tray_thread is not None and tray_thread is not threading.current_thread():
+            try:
+                tray_thread.join(timeout=1.0)
+                logger.info(
+                    "tray thread join completed: alive=%s timeout=%s",
+                    tray_thread.is_alive(),
+                    1.0,
+                )
+            except Exception:
+                logger.exception("tray thread join failed")
+
+        logger.info("shutdown cleanup completed")
 
     def _quit_from_tray(self) -> None:
         """在 Tk 主线程中完成托盘退出，避免从 pystray 线程触碰 Tk。"""
-        self._cancel_dock_jobs()
+        if self._shutdown_started:
+            return
+        logger.info(
+            "quit requested from tray: dock_state=%s tray_hidden=%s "
+            "restore_was_docked=%s shutdown_started=%s",
+            self._dock_state,
+            self._tray_hidden,
+            self._tray_restore_was_docked,
+            self._shutdown_started,
+        )
         if self._dock_state == "free":
             self._remember_expanded_geometry(self._current_window_geometry())
         else:
             self._remember_expanded_geometry(self._expanded_geometry)
         self._save_window_geometry_now()
-
-        tray_icon = self._tray_icon
-        self._tray_icon = None
-        if tray_icon is not None:
-            try:
-                tray_icon.stop()
-            except Exception as exc:
-                logger.debug("tray stop skipped during quit: %s", exc)
-
-        self.quit()
+        self._cleanup_before_exit()
+        # _cleanup_before_exit owns tray_icon.stop() and is safe to repeat.
+        try:
+            self.quit()
+        except Exception:
+            logger.exception("Tk quit failed")
 
     def _minimize_to_tray(self) -> None:
         """隐藏窗口并在系统托盘中生成一个精美的托盘图标。"""
-        self._tray_hidden = True
-        self._tray_restore_was_docked = self._dock_state in {
-            "docked_expanded", "collapsing", "collapsed", "expanding",
-        }
-        self._cancel_dock_jobs()
-        if self._tray_restore_was_docked:
-            self._remember_expanded_geometry(self._expanded_geometry)
-        else:
-            self._remember_expanded_geometry(self._current_window_geometry())
-        self._save_window_geometry_now()
-        self.withdraw() # 隐藏主窗口
-        self._ensure_tray_icon()
-
-        self._toast("AiTool 已最小化到托盘常驻后台", "success")
-
-    def _ensure_tray_icon(self) -> None:
-        """创建并启动托盘图标；隐藏和恢复之间始终复用同一个图标。"""
-        if self._tray_icon is not None:
+        if self._shutdown_started:
             return
+        try:
+            self._tray_restore_was_docked = self._dock_state in {
+                "docked_expanded", "collapsing", "collapsed", "expanding",
+            }
+            self._cancel_dock_jobs()
+            if self._tray_restore_was_docked:
+                self._remember_expanded_geometry(self._expanded_geometry)
+            else:
+                self._remember_expanded_geometry(self._current_window_geometry())
+            self._save_window_geometry_now()
 
-        # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
-        import pystray
+            # Create the icon before withdrawing.  If pystray/Win32 setup
+            # fails, keeping the window visible is safer than losing the UI.
+            if not self._ensure_tray_icon():
+                self._tray_restore_was_docked = False
+                self._tray_hidden = False
+                logger.error("minimize to tray aborted: tray icon unavailable")
+                return
+            self._tray_hidden = True
+            logger.info(
+                "minimize to tray: dock_state=%s tray_hidden=%s restore_was_docked=%s",
+                self._dock_state,
+                self._tray_hidden,
+                self._tray_restore_was_docked,
+            )
+            self.withdraw() # 隐藏主窗口
+            self._toast("AiTool 已最小化到托盘常驻后台", "success")
+        except Exception:
+            self._tray_hidden = False
+            logger.exception("minimize to tray failed; keeping window visible")
+            try:
+                self.deiconify()
+            except Exception:
+                logger.exception("minimize to tray visibility rollback failed")
 
-        # 使用统一绘制的高颜值科技图标
-        img = self._create_app_icon()
+    def _dispatch_from_tray(self, callback, description: str) -> None:
+        """Queue a tray action; only the Tk timer pump touches the callback."""
 
-        def _show_app(icon, item):
-            """从托盘菜单调度主窗口恢复，保留托盘图标。"""
-            self.after(0, self._restore_from_tray)
+        if self._shutdown_started:
+            return
+        try:
+            self._tray_dispatch_queue.put((callback, description))
+        except Exception:
+            logger.exception("tray %s dispatch queueing failed", description)
 
-        def _quit_app(icon, item):
-            """彻底安全退出应用，清除托盘"""
-            self.after(0, self._quit_from_tray)
+    def _poll_tray_dispatch_queue(self) -> None:
+        """Run queued tray actions on the Tk main thread."""
 
-        def _get_startup_menu_label(item):
-            return "✓ 开机自启动" if self._get_startup_status() else "开机自启动"
+        self._tray_dispatch_job = None
+        if self._shutdown_started:
+            return
+        try:
+            while True:
+                try:
+                    callback, description = self._tray_dispatch_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if self._shutdown_started:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("tray %s dispatch failed", description)
+        finally:
+            if not self._shutdown_started:
+                try:
+                    self._tray_dispatch_job = self.after(50, self._poll_tray_dispatch_queue)
+                except Exception:
+                    logger.exception("tray dispatch poll rescheduling failed")
 
-        menu = pystray.Menu(
-            pystray.MenuItem("打开 AiTool", _show_app, default=True), # 设为双击默认动作
-            pystray.MenuItem("设置中心", self._show_settings_dialog),
-            pystray.MenuItem(_get_startup_menu_label, self._toggle_startup),
-            pystray.MenuItem("彻底退出", _quit_app)
-        )
+    def _ensure_tray_icon(self) -> bool:
+        """创建并启动托盘图标；隐藏和恢复之间始终复用同一个图标。"""
+        if self._shutdown_started or self._tray_icon is not None:
+            return self._tray_icon is not None
 
-        self._tray_icon = pystray.Icon("AiTool", img, "AiTool 桌面工具", menu)
+        try:
+            # 如果托盘图标尚未启动，则在后台守护线程中初始化并启动它
+            import pystray
 
-        # 使用 threading 启动托盘图标轮询监听，防止阻塞 Tkinter 的 mainloop 主线程！
-        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+            # 使用统一绘制的高颜值科技图标
+            img = self._create_app_icon()
+
+            def _show_app(icon, item):
+                self._dispatch_from_tray(self._restore_from_tray, "restore")
+
+            def _quit_app(icon, item):
+                self._dispatch_from_tray(self._quit_from_tray, "quit")
+
+            def _settings_app(icon, item):
+                self._dispatch_from_tray(self._show_settings_dialog, "settings")
+
+            def _startup_app(icon, item):
+                self._dispatch_from_tray(self._toggle_startup, "startup")
+
+            def _get_startup_menu_label(item):
+                # Menu label evaluation also happens on the pystray thread;
+                # use cached state rather than querying Tk/Win32 there.
+                return "✓ 开机自启动" if self._tray_startup_enabled else "开机自启动"
+
+            menu = pystray.Menu(
+                pystray.MenuItem("打开 AiTool", _show_app, default=True),
+                pystray.MenuItem("设置中心", _settings_app),
+                pystray.MenuItem(_get_startup_menu_label, _startup_app),
+                pystray.MenuItem("彻底退出", _quit_app),
+            )
+
+            self._tray_icon = pystray.Icon("AiTool", img, "AiTool 桌面工具", menu)
+            self._tray_startup_enabled = self._get_startup_status()
+
+            # Keep a reference so shutdown can stop and briefly join it.
+            self._tray_thread = threading.Thread(
+                target=self._tray_icon.run,
+                name="AiToolTray",
+                daemon=True,
+            )
+            self._tray_thread.start()
+            logger.info("tray thread started: daemon=%s", self._tray_thread.daemon)
+            return True
+        except Exception:
+            self._tray_icon = None
+            self._tray_thread = None
+            logger.exception("tray icon creation/start failed")
+            return False
 
 
     def _restore_from_tray(self) -> None:
         """从托盘恢复窗口显示"""
+        if self._shutdown_started:
+            return
         self._cancel_dock_jobs()
         self._dock_restore_blocked = True
         self._tray_hidden = False
+        logger.info(
+            "restore from tray: dock_state=%s tray_hidden=%s restore_was_docked=%s",
+            self._dock_state,
+            self._tray_hidden,
+            self._tray_restore_was_docked,
+        )
         self.deiconify()
         self.attributes("-topmost", self._pinned)
         self.focus_force()
@@ -2357,7 +2381,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             self._dock_state = "free"
         self._tray_restore_was_docked = False
-        self.after_idle(self._finish_tray_restore)
+        try:
+            if not self._shutdown_started:
+                self.after_idle(self._finish_tray_restore)
+        except Exception:
+            logger.exception("tray restore completion dispatch failed")
 
     def _finish_tray_restore(self) -> None:
         self._dock_restore_blocked = False
@@ -2374,7 +2402,12 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.grid_rowconfigure(1, weight=0)
 
         import tkinter as tk
-        self.content = ctk.CTkFrame(self, fg_color=self._t("background"), corner_radius=0)
+        self.content = ctk.CTkFrame(
+            self,
+            fg_color=self._t("background"),
+            bg_color=self._t("background"),
+            corner_radius=0,
+        )
         self.content.grid(row=0, column=0, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=0)
@@ -2390,111 +2423,6 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.bind_all("<Control-v>", self._on_paste)
         self.bind("<Enter>", self._on_dock_enter, add="+")
         self.bind("<Leave>", self._on_dock_leave, add="+")
-
-    def _build_height_resize_grip(self) -> None:
-        """Build the internal, vertical-only height resize target."""
-
-        self._height_resize_grip = ctk.CTkFrame(
-            self.content,
-            height=6,
-            fg_color=self._t("surface"),
-            border_width=1,
-            border_color=self._t("border"),
-            corner_radius=0,
-            cursor="sb_v_double_arrow",
-        )
-        self._height_resize_grip.grid(row=2, column=0, sticky="ew")
-        self._height_resize_grip.grid_propagate(False)
-        self._height_resize_grip.bind("<Button-1>", self._on_height_grip_press, add="+")
-        self._height_resize_grip.bind("<B1-Motion>", self._on_height_grip_motion, add="+")
-        self._height_resize_grip.bind("<ButtonRelease-1>", self._on_height_grip_release, add="+")
-
-    def _on_height_grip_press(self, event) -> None:
-        """Start a height-only drag when normal free geometry owns the window."""
-
-        if (
-            self._dock_state != "free"
-            or self._geometry_restoring
-            or getattr(self, "_tray_hidden", False)
-        ):
-            return
-
-        try:
-            geometry = self._current_window_geometry()
-            if geometry is None:
-                return
-            work_area = self._dock_area_for_geometry(geometry)
-            if work_area is None:
-                return
-            self._cancel_dock_job("_dock_debounce_job")
-            self._cancel_dock_job("_dock_autohide_job")
-            self._cancel_geometry_save_job()
-            self._height_resizing = True
-            self._height_resize_origin = (
-                int(event.x_root),
-                int(event.y_root),
-                geometry.x,
-                geometry.y,
-                geometry.height,
-                work_area.height,
-            )
-        except Exception:
-            # Tk can destroy or remap the grip between the button event and
-            # this callback.  A failed press must never leave resize mode set.
-            self._height_resizing = False
-            self._height_resize_origin = None
-
-    def _on_height_grip_motion(self, event) -> None:
-        """Apply the pointer delta to height without persisting each frame."""
-
-        if not self._height_resizing or self._height_resize_origin is None:
-            return
-        if (
-            self._dock_state != "free"
-            or self._geometry_restoring
-            or getattr(self, "_tray_hidden", False)
-        ):
-            return
-
-        try:
-            _origin_x, origin_y, _start_x, _start_y, start_height, max_height = self._height_resize_origin
-            geometry = self._current_window_geometry()
-            if geometry is None:
-                return
-            work_area = self._dock_area_for_geometry(geometry)
-            if work_area is None:
-                return
-            max_height = min(max_height, work_area.height)
-            min_height = min(MIN_WINDOW_HEIGHT, max_height)
-            height = min(
-                max(start_height + int(event.y_root) - origin_y, min_height),
-                max_height,
-            )
-            width = min(DEFAULT_WINDOW_WIDTH, work_area.width)
-            target = WindowGeometry(geometry.x, geometry.y, width, height)
-            # Keep Configure/save handling behind the existing acknowledgement
-            # fence; only release schedules the disk write.
-            self._set_window_geometry(target, write_geometry=False)
-            self.geometry(self._geometry_to_string(target))
-        except Exception:
-            # Ignore Tkinter.TclError when the window is withdrawn or destroyed
-            # while the pointer is still held.
-            return
-
-    def _on_height_grip_release(self, _event=None) -> None:
-        """End a height drag and reuse the normal debounced geometry save."""
-
-        if not self._height_resizing:
-            return
-        self._height_resizing = False
-        self._height_resize_origin = None
-        self._clear_expected_geometry()
-        if (
-            self._dock_state == "free"
-            and not self._geometry_restoring
-            and not getattr(self, "_tray_hidden", False)
-        ):
-            self._schedule_geometry_save()
 
     def _build_station_area(self) -> None:
         import tkinter as tk
@@ -2629,6 +2557,106 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._register_dnd_recursive(self.actions_scroll)
         self.after_idle(lambda: self._sync_scrollbar_visibility(self._actions_canvas, self.actions_scrollbar))
 
+    def _build_height_resize_grip(self) -> None:
+        """Build the internal, vertical-only height resize target."""
+
+        self._height_resize_grip = ctk.CTkFrame(
+            self.content,
+            height=6,
+            fg_color=self._t("surface"),
+            bg_color=self._t("background"),
+            border_width=1,
+            border_color=self._t("border"),
+            corner_radius=0,
+            cursor="sb_v_double_arrow",
+        )
+        self._height_resize_grip.grid(row=2, column=0, sticky="ew")
+        self._height_resize_grip.grid_propagate(False)
+        self._height_resize_grip.bind("<Button-1>", self._on_height_grip_press, add="+")
+        self._height_resize_grip.bind("<B1-Motion>", self._on_height_grip_motion, add="+")
+        self._height_resize_grip.bind("<ButtonRelease-1>", self._on_height_grip_release, add="+")
+
+    def _on_height_grip_press(self, event) -> None:
+        """Start a height-only drag when normal free geometry owns the window."""
+
+        if (
+            self._dock_state != "free"
+            or self._geometry_restoring
+            or getattr(self, "_tray_hidden", False)
+        ):
+            return
+
+        try:
+            geometry = self._current_window_geometry()
+            if geometry is None:
+                return
+            work_area = self._dock_area_for_geometry(geometry)
+            if work_area is None:
+                return
+            self._cancel_dock_job("_dock_debounce_job")
+            self._cancel_dock_job("_dock_autohide_job")
+            self._cancel_geometry_save_job()
+            self._height_resizing = True
+            self._height_resize_origin = (
+                int(event.x_root),
+                int(event.y_root),
+                geometry.x,
+                geometry.y,
+                geometry.height,
+                work_area.height,
+            )
+        except Exception:
+            self._height_resizing = False
+            self._height_resize_origin = None
+
+    def _on_height_grip_motion(self, event) -> None:
+        """Apply the pointer delta to height without persisting each frame."""
+
+        if not self._height_resizing or self._height_resize_origin is None:
+            return
+        if (
+            self._dock_state != "free"
+            or self._geometry_restoring
+            or getattr(self, "_tray_hidden", False)
+        ):
+            return
+
+        try:
+            _origin_x, origin_y, _start_x, _start_y, start_height, max_height = self._height_resize_origin
+            geometry = self._current_window_geometry()
+            if geometry is None:
+                return
+            work_area = self._dock_area_for_geometry(geometry)
+            if work_area is None:
+                return
+            max_height = min(max_height, work_area.height)
+            min_height = min(MIN_WINDOW_HEIGHT, max_height)
+            height = min(
+                max(start_height + int(event.y_root) - origin_y, min_height),
+                max_height,
+            )
+            width = min(DEFAULT_WINDOW_WIDTH, work_area.width)
+            target = WindowGeometry(geometry.x, geometry.y, width, height)
+            self._set_window_geometry(target, write_geometry=False)
+            self.geometry(self._geometry_to_string(target))
+        except Exception:
+            return
+
+    def _on_height_grip_release(self, _event=None) -> None:
+        """End a height drag and reuse the normal debounced geometry save."""
+
+        if not self._height_resizing:
+            return
+        self._height_resizing = False
+        self._height_resize_origin = None
+        self._clear_expected_geometry()
+        if (
+            self._dock_state == "free"
+            and not self._geometry_restoring
+            and not getattr(self, "_tray_hidden", False)
+        ):
+            self._schedule_geometry_save()
+
     def _sync_scrollbar_visibility(self, canvas, scrollbar) -> None:
         """Show a scrollbar only when its content exceeds the canvas viewport."""
 
@@ -2653,18 +2681,28 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _build_statusbar(self) -> None:
         import tkinter as tk
 
-        self.statusbar = ctk.CTkFrame(self, fg_color=self._t("surface"), height=30, corner_radius=0)
+        self.statusbar = ctk.CTkFrame(
+            self,
+            fg_color=self._t("surface"),
+            bg_color=self._t("surface"),
+            height=30,
+            corner_radius=0,
+        )
         self.statusbar.grid(row=1, column=0, sticky="ew")
         self.statusbar.grid_propagate(False)
         self._register_dnd_target(self.statusbar)
 
         self.status_dot = ctk.CTkLabel(self.statusbar, text="●", width=20,
                                        text_color=self._t("success"),
+                                       bg_color=self._t("surface"),
+                                       fg_color="transparent",
                                        font=ctk.CTkFont(family=FONT, size=9))
         self.status_dot.grid(row=0, column=0, padx=(SPACING["md"], SPACING["xs"]))
 
         self.status_label = ctk.CTkLabel(self.statusbar, text="就绪，拖动至桌面上边缘可隐藏", font=ctk.CTkFont(family=FONT, size=FS["status"]),
-                                         text_color=self._t("secondary"))
+                                         text_color=self._t("secondary"),
+                                         bg_color=self._t("surface"),
+                                         fg_color="transparent")
         self.status_label.grid(row=0, column=1, sticky="w")
         self._register_dnd_recursive(self.statusbar)
 
@@ -2674,6 +2712,7 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._dock_handle = ctk.CTkFrame(
             self.statusbar,
             fg_color=self._t("surface"),
+            bg_color=self._t("surface"),
             border_width=1,
             border_color=self._t("border"),
             corner_radius=0,
@@ -3800,11 +3839,11 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
             "  - 将窗口拖到屏幕顶部并停留即可停靠；鼠标离开后会自动收起，\n"
             "    只露出约 30px 的横条。鼠标移入横条即可展开。\n"
             "  - 顶部收起与隐藏到系统托盘是两种独立方式。\n\n"
-            "⌨️ 快捷键与托盘\n"
+            "🖥️ 托盘与操作\n"
             "========================================\n"
-            "  - Alt+A：正常显示时隐藏到 Windows 右下角系统托盘；\n"
-            "    托盘隐藏时恢复窗口；顶部横条收起时展开顶部窗口。\n"
-            "  - 关闭按钮会隐藏到系统托盘，不会直接退出程序。托盘菜单提供：\n"
+            "  - 关闭按钮会隐藏到系统托盘，不会直接退出程序。\n"
+            "  - 窗口不显示在 Windows 任务栏按钮中；托盘菜单可以恢复窗口。\n"
+            "  - 顶部收起时将鼠标移入横条即可展开窗口。托盘菜单提供：\n"
             "    打开 AiTool、设置中心、开机自启动切换、彻底退出。\n\n"
             "📥 拖放、粘贴与中转站\n"
             "========================================\n"
@@ -3831,6 +3870,27 @@ class DesktopToolApp(ctk.CTk, TkinterDnD.DnDWrapper):
                       command=guide.destroy).pack(fill="x", padx=20, pady=(12, 16))
 
 def main() -> int:
-    app = DesktopToolApp()
-    app.mainloop()
-    return 0
+    app = None
+    try:
+        logger.info(
+            "main startup: pid=%s ppid=%s frozen=%s",
+            os.getpid(),
+            os.getppid(),
+            bool(getattr(sys, "frozen", False)),
+        )
+        app = DesktopToolApp()
+        app.mainloop()
+        logger.info("Tk mainloop returned normally")
+        return 0
+    finally:
+        if app is not None:
+            try:
+                app._cleanup_before_exit()
+            except Exception:
+                logger.exception("main finally cleanup failed")
+            try:
+                if app.winfo_exists():
+                    app.destroy()
+                    logger.info("Tk root destroyed")
+            except Exception:
+                logger.exception("Tk root destroy failed")

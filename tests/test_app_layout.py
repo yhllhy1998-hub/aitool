@@ -198,11 +198,10 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("_schedule_geometry_save", APP_SOURCE)
         self.assertIn("self.after(350, self._save_window_geometry_now)", APP_SOURCE)
 
-    def test_fixed_width_restore_and_height_grip_are_wired_without_gui(self) -> None:
+    def test_fixed_width_restore_and_internal_height_grip_are_wired_without_gui(self) -> None:
         init = _method_source("_init_window")
         save = _method_source("_save_window_geometry_now")
         build = _method_source("_build_ui")
-        grip = _method_source("_build_height_resize_grip")
 
         self.assertIn("DEFAULT_WINDOW_WIDTH", APP_SOURCE)
         self.assertIn("fixed_width = min(DEFAULT_WINDOW_WIDTH, work_area.width)", init)
@@ -213,12 +212,8 @@ class AppLayoutSourceTests(unittest.TestCase):
 
         self.assertIn("self.content.grid_rowconfigure(2, weight=0)", build)
         self.assertIn("self._build_height_resize_grip()", build)
-        self.assertIn("self._height_resize_grip =", grip)
-        self.assertIn("self._height_resize_grip.grid(row=2, column=0, sticky=\"ew\")", grip)
-        self.assertIn('fg_color=self._t("surface")', grip)
-        self.assertIn('border_color=self._t("border")', grip)
-        self.assertIn('cursor="sb_v_double_arrow"', grip)
-        self.assertNotIn("_register_dnd", grip)
+        self.assertIn("_build_height_resize_grip", APP_SOURCE)
+        self.assertIn("_on_height_grip_", APP_SOURCE)
 
     def test_content_grip_does_not_change_root_statusbar_layout(self) -> None:
         build = _method_source("_build_ui")
@@ -236,7 +231,7 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("def _refresh_theme", APP_SOURCE)
         self.assertIn("self.btn_theme", _method_source("_build_station_area"))
         self.assertIn("command=self._toggle_theme", _method_source("_build_station_area"))
-        self.assertIn("ctk.set_appearance_mode(self.effective_theme)", APP_SOURCE)
+        self.assertIn("_configure_startup_appearance", APP_SOURCE)
         self.assertIn("self._tokens", APP_SOURCE)
 
         self.assertIn("from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD", APP_SOURCE)
@@ -249,7 +244,7 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn('self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)', APP_SOURCE)
         self.assertIn("def _quit_from_tray", APP_SOURCE)
         self.assertIn("self.quit()", _method_source("_quit_from_tray"))
-        self.assertIn("self.after(0, self._quit_from_tray)", APP_SOURCE)
+        self.assertIn("_dispatch_from_tray(self._quit_from_tray", APP_SOURCE)
 
     def test_native_titlebar_configure_is_isolated_from_dock_animation(self) -> None:
         save = _method_source("_schedule_geometry_save")
@@ -265,20 +260,28 @@ class AppLayoutSourceTests(unittest.TestCase):
         self.assertIn("self._DOCK_SIZE_CHANGE_THRESHOLD", observe)
         self.assertIn("self._dock_resize_blocked", observe)
 
-    def test_native_style_is_applied_after_titlebar_is_kept_and_before_configure_binding(self) -> None:
+    def test_native_titlebar_matches_master_without_native_style_rewrite(self) -> None:
         init = _method_source("_init_window")
         self.assertIn("self.overrideredirect(False)", init)
-        self.assertIn("self.update_idletasks()", init)
-        self.assertIn("self._apply_native_window_style_once()", init)
+        self.assertNotIn("self.update_idletasks()", init)
+        self.assertIn("self.resizable(False, False)", init)
+        self.assertNotIn("_disable_native_resize_and_maximize", init)
+        self.assertNotIn("self._apply_native_window_style_once()", init)
+        self.assertNotIn("self._schedule_native_window_style_reapply()", init)
+        self.assertNotIn("self._set_native_taskbar_visibility(", init)
+        self.assertIn('self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)', APP_SOURCE)
         self.assertIn('self.bind("<Configure>", self._schedule_geometry_save, add="+")', init)
-        self.assertLess(
-            init.index("self.overrideredirect(False)"),
-            init.index("self._apply_native_window_style_once()"),
-        )
-        self.assertLess(
-            init.index("self._apply_native_window_style_once()"),
-            init.index('self.bind("<Configure>", self._schedule_geometry_save'),
-        )
+        for symbol in (
+            "GWL_STYLE",
+            "GWL_EXSTYLE",
+            "WS_MAXIMIZEBOX",
+            "WS_EX_TOOLWINDOW",
+            "WS_EX_APPWINDOW",
+            "GetWindowLongPtrW",
+            "SetWindowLongPtrW",
+            "SWP_FRAMECHANGED",
+        ):
+            self.assertNotIn(symbol, APP_SOURCE)
 
     def test_programmatic_configure_ack_and_native_quiet_timer_are_explicit(self) -> None:
         setter = _method_source("_set_window_geometry")

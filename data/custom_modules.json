@@ -1,0 +1,13 @@
+{
+  "updated_at": "2026-07-17T10:23:47+08:00",
+  "modules": [
+    {
+      "module_id": "60067e5d5f1e",
+      "name": "打开网页aihub.bbg",
+      "module_type": "open-web",
+      "params": {
+        "url": "https://aihub.bbgameonline.com/"
+      }
+    }
+  ]
+}

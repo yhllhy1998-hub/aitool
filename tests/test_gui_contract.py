@@ -28,8 +28,10 @@ import aitool_desktop.app as app_module
 
 APP_PATH = REPO_ROOT / "src" / "aitool_desktop" / "app.py"
 THEME_PATH = REPO_ROOT / "src" / "aitool_desktop" / "theme.py"
+RUN_PATH = REPO_ROOT / "run_desktop_tool.py"
 APP_SOURCE = APP_PATH.read_text(encoding="utf-8")
 THEME_SOURCE = THEME_PATH.read_text(encoding="utf-8")
+RUN_SOURCE = RUN_PATH.read_text(encoding="utf-8")
 APP_TREE = ast.parse(APP_SOURCE, filename=str(APP_PATH))
 
 
@@ -182,7 +184,7 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("outer_top", observe)
         self.assertIn("abs(outer_top - area.top) > self._DOCK_EDGE_THRESHOLD", observe)
 
-    def test_native_quiet_resize_block_reobserves_top_for_normal_window(self) -> None:
+    def test_native_quiet_resize_block_remains_for_resizable_native_window(self) -> None:
         class FakeDock:
             _geometry_restoring = False
             _dock_restore_blocked = False
@@ -233,9 +235,8 @@ class GuiContractTests(unittest.TestCase):
 
         fake = FakeDock()
         app_module.DesktopToolApp._finish_native_titlebar_interaction(fake)
-        self.assertFalse(fake._dock_resize_blocked)
-        self.assertEqual(fake.scheduled[0][0], fake._DOCK_DEBOUNCE_MS)
-        self.assertIs(fake.scheduled[0][1].__func__, app_module.DesktopToolApp._on_top_debounce)
+        self.assertTrue(fake._dock_resize_blocked)
+        self.assertEqual(fake.scheduled, [])
 
     def test_top_edge_threshold_still_controls_dock_observation(self) -> None:
         class FakeDock:
@@ -330,9 +331,11 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("self._dock_native_interaction", autohide)
         self.assertIn("self._dock_resize_blocked", autohide)
 
-    def test_internal_height_resize_grip_is_vertical_only_and_dock_safe(self) -> None:
+    def test_internal_height_resize_grip_is_restored_and_dock_safe(self) -> None:
         init = _source(_function("__init__"))
-        build = _source(_function("_build_height_resize_grip"))
+        build = _source(_function("_build_ui"))
+        grip = _source(_function("_build_height_resize_grip"))
+        refresh_theme = _source(_function("_refresh_theme"))
         press = _source(_function("_on_height_grip_press"))
         motion = _source(_function("_on_height_grip_motion"))
         release = _source(_function("_on_height_grip_release"))
@@ -341,82 +344,100 @@ class GuiContractTests(unittest.TestCase):
 
         self.assertIn("self._height_resizing = False", init)
         self.assertIn("self._height_resize_origin = None", init)
-        for binding in (
-            '"<Button-1>"',
-            '"<B1-Motion>"',
-            '"<ButtonRelease-1>"',
-        ):
-            self.assertIn(binding, build)
-        self.assertIn('cursor="sb_v_double_arrow"', build)
-        self.assertIn('fg_color=self._t("surface")', build)
-        self.assertIn('border_color=self._t("border")', build)
-        self.assertIn('self._height_resize_grip.grid(row=2, column=0', build)
-        self.assertIn('self._dock_state != "free"', press)
-        self.assertIn("self._geometry_restoring", press)
-        self.assertIn('getattr(self, "_tray_hidden", False)', press)
-        self.assertIn("self._height_resizing = True", press)
+        self.assertIn("self.content.grid_rowconfigure(2, weight=0)", build)
+        self.assertIn('fg_color=self._t("background"),\n            bg_color=self._t("background"),', build)
+        self.assertIn("self._build_height_resize_grip()", build)
+        self.assertIn("self._height_resize_grip.grid(row=2, column=0", grip)
+        self.assertIn('fg_color=self._t("surface"),\n            bg_color=self._t("background"),', grip)
+        self.assertIn(
+            'self.content.configure(\n                fg_color=self._t("background"),\n                bg_color=self._t("background"),',
+            refresh_theme,
+        )
+        self.assertIn(
+            'self._height_resize_grip.configure(\n                fg_color=self._t("surface"),\n                bg_color=self._t("background"),',
+            refresh_theme,
+        )
+        self.assertIn('cursor="sb_v_double_arrow"', grip)
         self.assertIn("event.y_root", motion)
         self.assertIn("MIN_WINDOW_HEIGHT", motion)
-        self.assertIn("work_area.height", motion)
-        self.assertIn("write_geometry=False", motion)
         self.assertIn("self._height_resizing = False", release)
-        self.assertIn("self._schedule_geometry_save()", release)
         self.assertIn('getattr(self, "_height_resizing", False)', observe)
         self.assertIn('getattr(self, "_height_resizing", False)', debounce)
 
-    def test_fixed_width_and_non_snap_native_style_contract_remain_explicit(self) -> None:
+    def test_native_titlebar_contract_matches_master_without_taskbar_style_rewrite(self) -> None:
         init = _source(_function("_init_window"))
-        style = _source(_function("_disable_native_resize_and_maximize"))
         save = _source(_function("_save_window_geometry_now"))
 
         self.assertIn("DEFAULT_WINDOW_WIDTH", init)
         self.assertIn("self.resizable(False, False)", init)
+        self.assertNotIn("_disable_native_resize_and_maximize", init)
+        self.assertIn("self.overrideredirect(False)", init)
+        self.assertIn('self.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)', APP_SOURCE)
+        self.assertNotIn("overrideredirect(True)", APP_SOURCE)
         self.assertIn("DEFAULT_WINDOW_WIDTH", save)
-        self.assertIn("WS_THICKFRAME", style)
-        self.assertIn("WS_SIZEBOX", style)
-        self.assertIn("WS_MAXIMIZEBOX", style)
-        self.assertIn("style_mask", style)
+        for call in (
+            "self._apply_native_window_style_once()",
+            "self._schedule_native_window_style_reapply()",
+            "self._set_native_taskbar_visibility(",
+        ):
+            self.assertNotIn(call, init)
 
-    def test_native_titlebar_style_removes_resize_and_snap_capabilities(self) -> None:
-        style = _source(_function("_disable_native_resize_and_maximize"))
+    def test_native_titlebar_style_is_not_rewritten(self) -> None:
         for symbol in (
             "GWL_STYLE",
+            "GWL_EXSTYLE",
+            "WS_MAXIMIZEBOX",
+            "WS_EX_TOOLWINDOW",
+            "WS_EX_APPWINDOW",
             "GetWindowLongPtrW",
             "SetWindowLongPtrW",
-            "WS_THICKFRAME",
-            "WS_SIZEBOX",
-            "WS_MAXIMIZEBOX",
-            "WS_CAPTION",
-            "WS_SYSMENU",
-            "WS_MINIMIZEBOX",
-            "SWP_NOMOVE",
-            "SWP_NOSIZE",
-            "SWP_NOZORDER",
-            "SWP_NOACTIVATE",
             "SWP_FRAMECHANGED",
+            "_disable_native_resize_and_maximize",
+            "_apply_native_window_style_once",
+            "_reapply_native_window_style_after_map",
+            "_schedule_native_window_style_reapply",
+            "_set_native_taskbar_visibility",
         ):
-            self.assertIn(symbol, style)
-        self.assertIn("GA_ROOT", APP_SOURCE)
-
+            self.assertNotIn(symbol, APP_SOURCE)
         init = _source(_function("_init_window"))
         self.assertIn("self.overrideredirect(False)", init)
         self.assertNotIn("overrideredirect(True)", APP_SOURCE)
-        self.assertIn("self._apply_native_window_style_once()", init)
-        self.assertIn("self._schedule_native_window_style_reapply()", init)
 
-        apply_once = _source(_function("_apply_native_window_style_once"))
-        self.assertIn("self._native_window_style_applied", apply_once)
-        self.assertIn("self.winfo_id()", apply_once)
+    def test_native_subclass_message_chain_is_removed(self) -> None:
+        for symbol in (
+            "SetWindowSubclass",
+            "RemoveWindowSubclass",
+            "DefSubclassProc",
+            "WM_WINDOWPOSCHANGING",
+            "WM_NCDESTROY",
+        ):
+            self.assertNotIn(symbol, APP_SOURCE)
+        self.assertNotIn("_install_native_window_subclass", APP_SOURCE)
+        self.assertNotIn("_remove_native_window_subclass", APP_SOURCE)
+        self.assertNotIn("_handle_native_window_subclass_message", APP_SOURCE)
 
-        reapply = _source(_function("_reapply_native_window_style_after_map"))
-        self.assertIn("self.update_idletasks()", reapply)
-        self.assertIn("self.winfo_id()", reapply)
-        self.assertIn("_disable_native_resize_and_maximize(hwnd)", reapply)
-
-        schedule = _source(_function("_schedule_native_window_style_reapply"))
-        self.assertIn("self._native_window_style_reapply_scheduled", schedule)
-        self.assertIn('self.bind(\"<Map>\"', schedule)
-        self.assertIn("self.after_idle(self._reapply_native_window_style_after_map)", schedule)
+    def test_diagnostic_logging_contract_contains_process_location_and_state_fields(self) -> None:
+        formatter = _source(
+            next(
+                node
+                for node in ast.walk(ast.parse(RUN_SOURCE, filename=str(RUN_PATH)))
+                if isinstance(node, ast.FunctionDef) and node.name == "_configure_logging"
+            ),
+            RUN_SOURCE,
+        )
+        for field in ("%(process)d", "%(module)s", "%(lineno)d"):
+            self.assertIn(field, formatter)
+        self.assertIn("main startup: pid=%s ppid=%s frozen=%s", APP_SOURCE)
+        for method_name, marker in (
+            ("_minimize_to_tray", "minimize to tray"),
+            ("_restore_from_tray", "restore from tray"),
+            ("_request_dock_collapse", "dock collapse requested"),
+            ("_request_dock_expand", "dock expand requested"),
+            ("_quit_from_tray", "quit requested from tray"),
+        ):
+            self.assertIn(marker, _source(_function(method_name)))
+        for state in ("_dock_state", "_tray_hidden"):
+            self.assertIn(state, APP_SOURCE)
 
     def test_native_style_resolves_visible_root_hwnd_from_tk_client_hwnd(self) -> None:
         class FakeGetAncestor:
@@ -491,12 +512,12 @@ class GuiContractTests(unittest.TestCase):
         resolve_hwnd.assert_called_once_with(0x1234)
         self.assertEqual(get_window_rect.calls[0][0], resolved_hwnd)
 
-    def test_tray_restore_relies_on_persistent_map_style_reapply(self) -> None:
+    def test_tray_restore_does_not_rewrite_native_window_style(self) -> None:
         restore = _source(_function("_restore_from_tray"))
-        schedule = _source(_function("_schedule_native_window_style_reapply"))
         self.assertIn("self.deiconify()", restore)
+        self.assertNotIn("_apply_native_window_style_once", restore)
         self.assertNotIn("_schedule_native_window_style_reapply", restore)
-        self.assertIn('self.bind("<Map>", self._reapply_native_window_style_after_map, add="+")', schedule)
+        self.assertNotIn("_set_native_taskbar_visibility", restore)
 
     def test_tray_hidden_visibility_state_is_separate_from_top_docking(self) -> None:
         init = _source(_function("__init__"))
@@ -515,81 +536,53 @@ class GuiContractTests(unittest.TestCase):
     def test_tray_icon_is_persistent_until_explicit_quit(self) -> None:
         ensure = _source(_function("_ensure_tray_icon"))
         quit_source = _source(_function("_quit_from_tray"))
+        cleanup = _source(_function("_cleanup_before_exit"))
 
         self.assertIn("def _ensure_tray_icon", APP_SOURCE)
         self.assertIn("self._tray_icon is not None", ensure)
-        self.assertIn("self.after(0, self._restore_from_tray)", ensure)
+        self.assertIn("_dispatch_from_tray", ensure)
         self.assertNotIn("icon.stop()", ensure)
-        self.assertNotIn("self._tray_icon = None", ensure)
+        self.assertIn("self._tray_icon = None", ensure)
+        self.assertIn("tray icon creation/start failed", ensure)
         self.assertIn("tray_icon.stop()", quit_source)
+        self.assertIn("self._tray_thread", APP_SOURCE)
+        self.assertIn("tray_thread.join(timeout=1.0)", cleanup)
+        self.assertIn("tray_thread.is_alive()", cleanup)
 
     def test_top_docking_collapsed_state_remains_distinct_from_tray_hidden(self) -> None:
-        hotkey = _source(_function("_setup_global_hotkey"))
-        self.assertIn('self._dock_state in ("collapsed", "collapsing", "expanding")', hotkey)
         self.assertIn('self._dock_state = "collapsed"', APP_SOURCE)
         self.assertIn('"docked_expanded", "collapsing", "collapsed", "expanding"', APP_SOURCE)
 
-    def test_native_style_uses_pointer_sized_ctypes_and_verifies_second_read(self) -> None:
-        class FakeGetWindowLongPtr:
-            def __init__(self, style: int) -> None:
-                self.style = style
-                self.calls = []
-                self.argtypes = None
-                self.restype = None
+    def test_tray_actions_are_main_thread_dispatched_and_minimize_rolls_back(self) -> None:
+        ensure = _source(_function("_ensure_tray_icon"))
+        dispatch = _source(_function("_dispatch_from_tray"))
+        pump = _source(_function("_poll_tray_dispatch_queue"))
+        minimize = _source(_function("_minimize_to_tray"))
 
-            def __call__(self, hwnd, index):
-                self.calls.append((hwnd, index))
-                return self.style
-
-        class FakeSetWindowLongPtr:
-            def __init__(self, getter: FakeGetWindowLongPtr) -> None:
-                self.getter = getter
-                self.calls = []
-                self.argtypes = None
-                self.restype = None
-
-            def __call__(self, hwnd, index, value):
-                self.calls.append((hwnd, index, value))
-                previous = self.getter.style
-                self.getter.style = int(getattr(value, "value", value))
-                return previous
-
-        class FakeSetWindowPos:
-            def __init__(self) -> None:
-                self.calls = []
-                self.argtypes = None
-                self.restype = None
-
-            def __call__(self, *args):
-                self.calls.append(args)
-                return 1
-
-        hwnd = 0x1234567887654321
-        getter = FakeGetWindowLongPtr(0x16CF0008)
-        setter = FakeSetWindowLongPtr(getter)
-        set_pos = FakeSetWindowPos()
-        user32 = SimpleNamespace(
-            GetWindowLongPtrW=getter,
-            SetWindowLongPtrW=setter,
-            SetWindowPos=set_pos,
-        )
-
-        with patch.object(app_module.os, "name", "nt"), patch.object(
-            app_module.ctypes, "windll", SimpleNamespace(user32=user32)
+        for callback in (
+            "_restore_from_tray",
+            "_quit_from_tray",
+            "_show_settings_dialog",
+            "_toggle_startup",
         ):
-            self.assertTrue(app_module._disable_native_resize_and_maximize(hwnd))
+            self.assertIn(callback, ensure)
+        self.assertIn("self._tray_dispatch_queue.put", dispatch)
+        self.assertIn("self.after(50, self._poll_tray_dispatch_queue)", pump)
+        self.assertIn("self._shutdown_started", dispatch)
+        self.assertIn("if not self._ensure_tray_icon():", minimize)
+        self.assertLess(minimize.index("self._ensure_tray_icon()"), minimize.index("self.withdraw()"))
+        self.assertIn("self._tray_hidden = False", minimize)
+        self.assertIn("keeping window visible", minimize)
 
-        self.assertEqual(getter.argtypes, [wintypes.HWND, ctypes.c_int])
-        self.assertIs(getter.restype, app_module._LONG_PTR)
-        self.assertEqual(setter.argtypes, [wintypes.HWND, ctypes.c_int, app_module._LONG_PTR])
-        self.assertIs(setter.restype, app_module._LONG_PTR)
-        self.assertIs(set_pos.restype, wintypes.BOOL)
-        self.assertEqual(getter.calls[0][0].value, hwnd)
-        self.assertEqual(len(getter.calls), 3, "style must be read before and after both native updates")
-        self.assertEqual(setter.calls[0][0].value, hwnd)
-        self.assertIsInstance(setter.calls[0][2], app_module._LONG_PTR)
-        self.assertEqual(set_pos.calls[0][0].value, hwnd)
-        self.assertEqual(getter.style & app_module._NATIVE_STYLE_MASK, 0)
+    def test_global_hotkey_is_removed_from_source_and_settings(self) -> None:
+        for symbol in (
+            "WM_HOTKEY", "MOD_ALT", "MOD_NOREPEAT", "PM_REMOVE", "VK_A", "HOTKEY_ID",
+            "_NativeMSG", "_setup_global_hotkey", "_poll_global_hotkey", "_toggle_gui",
+            "RegisterHotKey", "UnregisterHotKey", "keyboard", "Alt + A", "alt+a",
+        ):
+            self.assertNotIn(symbol, APP_SOURCE)
+        self.assertNotIn("global native hotkey", APP_SOURCE)
+        self.assertNotIn("全局唤醒/隐藏快捷键", APP_SOURCE)
 
     def test_negative_outer_position_uses_native_positioning_and_expected_token(self) -> None:
         class FakeWindow:
@@ -791,7 +784,7 @@ class GuiContractTests(unittest.TestCase):
         self.assertIn("self._dock_resize_blocked", schedule)
         self.assertIn("delay = 250", schedule)
 
-    def test_dock_autohide_clears_stale_resize_block_and_collapses(self) -> None:
+    def test_dock_autohide_retains_resize_block_for_resizable_native_window(self) -> None:
         class FakeDock:
             _dock_state = "docked_expanded"
             _dock_native_interaction = False
@@ -824,9 +817,9 @@ class GuiContractTests(unittest.TestCase):
 
         fake = FakeDock()
         app_module.DesktopToolApp._autohide_if_pointer_left(fake)
-        self.assertFalse(fake._dock_resize_blocked)
-        self.assertEqual(fake.collapses, 1)
-        self.assertEqual(fake.scheduled, [])
+        self.assertTrue(fake._dock_resize_blocked)
+        self.assertEqual(fake.collapses, 0)
+        self.assertEqual(fake.scheduled[0][0], 250)
 
     def test_dock_autohide_does_not_collapse_during_native_interaction(self) -> None:
         class FakeDock:
@@ -971,6 +964,10 @@ class GuiContractTests(unittest.TestCase):
         statusbar = _source(_function("_build_statusbar"))
         dock_icon = _source(_function("_draw_dock_handle_icon"))
         self.assertIn("tk.Canvas(", statusbar)
+        self.assertIn('fg_color=self._t("surface")', statusbar)
+        self.assertIn('bg_color=self._t("surface")', statusbar)
+        self.assertIn('self.statusbar.configure(\n                fg_color=self._t("surface"),\n                bg_color=self._t("surface"),', _source(_function("_refresh_theme")))
+        self.assertIn('self._dock_handle.configure(\n                fg_color=self._t("surface"),\n                bg_color=self._t("surface"),', _source(_function("_refresh_theme")))
         self.assertIn("highlightthickness=0", statusbar)
         self.assertIn("self._draw_dock_handle_icon", statusbar)
         self.assertEqual(dock_icon.count("create_line"), 3)
@@ -990,6 +987,146 @@ class GuiContractTests(unittest.TestCase):
         add_button = _source(_function("_refresh_cards"))
         self.assertIn('text_color=self._t("add_button_text")', add_button)
 
+    def test_initial_theme_refresh_contract(self) -> None:
+        """The startup palette is applied once after the full widget tree is built.
+
+        A single ``update_idletasks()`` guarantees the complete geometry/color
+        layout before the first window mapping.  There is no separate
+        ``after_idle`` theme redraw that would destroy and rebuild dynamic
+        content after the initial paint.
+        """
+        init = _source(_function("__init__"))
+        toggle = _source(_function("_toggle_theme"))
+        refresh = _source(_function("_refresh_theme"))
+
+        # Build order: _build_ui → _refresh_all → update_idletasks
+        self.assertIn("self._build_ui()", init)
+        self.assertIn("self._refresh_all()", init)
+        self.assertIn("self.update_idletasks()", init)
+        idx_refresh = init.index("self._refresh_all()")
+        idx_idle = init.index("self.update_idletasks()")
+        self.assertGreater(idx_idle, idx_refresh,
+                           "update_idletasks must come after _refresh_all in __init__")
+
+        # _init_window must not call update_idletasks before children exist
+        init_win = _source(_function("_init_window"))
+        self.assertNotIn("update_idletasks", init_win,
+                         "_init_window must not call update_idletasks before child widgets are created")
+
+        # _refresh_initial_theme and its after_idle schedule are removed
+        self.assertNotIn("_refresh_initial_theme", APP_SOURCE)
+        self.assertNotIn("after_idle(self._refresh_initial_theme)", APP_SOURCE)
+
+        # Theme toggle still works through _refresh_theme
+        self.assertIn("self._refresh_theme()", toggle)
+        self.assertIn("def _refresh_theme(self, announce: bool = True)", refresh)
+        self.assertIn("self._t(\"surface\")", refresh)
+        self.assertIn("if announce:", refresh)
+        self.assertIn("self._set_status(", refresh)
+
+        # Fixed-area statusbar/dock_handle refresh is independent of
+        # _dock_handle_label Canvas existence (statusbar and _dock_handle are
+        # checked separately from the Canvas-dependent _dock_handle_label).
+        self.assertIn('if hasattr(self, "statusbar"):', refresh)
+        self.assertIn('if hasattr(self, "_dock_handle"):', refresh)
+        self.assertIn('if hasattr(self, "_dock_handle_label"):', refresh)
+        # The statusbar.configure call is inside its own hasattr block,
+        # not nested under _dock_handle_label.
+        statusbar_idx = refresh.index('if hasattr(self, "statusbar"):')
+        handle_idx = refresh.index('if hasattr(self, "_dock_handle"):')
+        label_idx = refresh.index('if hasattr(self, "_dock_handle_label"):')
+        self.assertLess(statusbar_idx, handle_idx)
+        self.assertLess(handle_idx, label_idx)
+
+        # Both status labels are constructed with explicit bg_color and
+        # transparent fg_color so the internal native Label never inherits
+        # the Windows default light background on the first paint.
+        statusbar = _source(_function("_build_statusbar"))
+        self.assertIn("self.status_dot = ctk.CTkLabel(self.statusbar", statusbar)
+        self.assertIn('bg_color=self._t("surface")', statusbar)
+        self.assertIn('fg_color="transparent"', statusbar)
+        self.assertIn("self.status_label = ctk.CTkLabel(self.statusbar", statusbar)
+
+        # _refresh_theme explicitly updates both labels in the statusbar
+        # block: bg_color, fg_color, and semantic text_color for each.
+        self.assertIn("self.status_dot.configure(", refresh)
+        self.assertIn("self.status_label.configure(", refresh)
+        # The status_dot configure must appear inside the hasattr("statusbar")
+        # block and include the success text_color.
+        statusbar_block = refresh[refresh.index('if hasattr(self, "statusbar"):'):]
+        self.assertIn("self.status_dot.configure(", statusbar_block)
+        self.assertIn("self.status_label.configure(", statusbar_block)
+        self.assertIn('text_color=self._t("success")', statusbar_block)
+        self.assertIn('text_color=self._t("secondary")', statusbar_block)
+        self.assertIn('fg_color="transparent"', statusbar_block)
+
+    def test_hide_dock_handle_restores_statusbar_labels_with_explicit_grid_and_color(self) -> None:
+        """After grid_remove/grid round-trip the status CTkLabels must be
+        restored with explicit grid parameters and explicit background colours.
+
+        A bare ``grid()`` re-inserts the widget into the master's grid but does
+        not carry layout options — on Windows the internal native Tk Label can
+        briefly flash the default light background (the "white block" bug).
+        This test enforces that :meth:`_hide_dock_handle` always passes the
+        original layout arguments and follows up with a colour refresh that
+        does **not** overwrite the semantic ``text_color``.
+        """
+        hide = _source(_function("_hide_dock_handle"))
+        refresh_method = _source(_function("_refresh_statusbar_labels"))
+
+        # Explicit grid parameters matching the initial _build_statusbar layout:
+        #   status_dot.grid(row=0, column=0, padx=(SPACING["md"], SPACING["xs"]))
+        #   status_label.grid(row=0, column=1, sticky="w")
+        self.assertIn("self.status_dot.grid(row=0, column=0, padx=(SPACING", hide,
+                        "_hide_dock_handle must use explicit grid params for status_dot")
+        self.assertIn('self.status_label.grid(row=0, column=1, sticky="w")', hide,
+                        "_hide_dock_handle must use explicit grid params for status_label")
+        self.assertNotIn("self.status_dot.grid()", hide,
+                         "_hide_dock_handle must NOT use bare grid() for status_dot")
+        self.assertNotIn("self.status_label.grid()", hide,
+                         "_hide_dock_handle must NOT use bare grid() for status_label")
+
+        # After restoring grid layout, _refresh_statusbar_labels is called.
+        self.assertIn("self._refresh_statusbar_labels()", hide,
+                      "_hide_dock_handle must call _refresh_statusbar_labels")
+
+        # _refresh_statusbar_labels configures bg_color/fg_color without
+        # touching text_color (semantic colours owned by _set_status and
+        # _refresh_theme).
+        self.assertIn("self.status_dot.configure(", refresh_method)
+        self.assertIn("self.status_label.configure(", refresh_method)
+        self.assertIn('bg_color=self._t("surface")', refresh_method)
+        self.assertIn('fg_color="transparent"', refresh_method)
+        self.assertNotIn("text_color", refresh_method,
+                         "_refresh_statusbar_labels must not set text_color")
+
+    def test_settings_dialog_matches_master_close_button_contract(self) -> None:
+        """验证设置中心关闭按钮及其 master 对齐的布局契约"""
+        settings_source = _source(_function("_show_settings_dialog"))
+
+        self.assertIn('dialog.geometry("320x260")', settings_source)
+        self.assertIn('ctk.CTkLabel(dialog, text="⚙️ AiTool 桌面工具 设置中心"', settings_source)
+        self.assertIn('size=13, weight="bold"', settings_source)
+        self.assertIn('pack(pady=(20, 16))', settings_source)
+        self.assertIn('switch.pack(pady=8)', settings_source)
+        self.assertIn('pack(pady=(0, 12))', settings_source)
+
+        self.assertIn('text="关闭设置"', settings_source)
+        self.assertIn('corner_radius=6', settings_source)
+        self.assertIn('fg_color=self._t("hover")', settings_source)
+        self.assertIn('hover_color=self._t("elevated")', settings_source)
+        self.assertIn('text_color=self._t("text")', settings_source)
+        self.assertIn('command=dialog.destroy', settings_source)
+        self.assertIn('pack(fill="x", padx=40)', settings_source)
+
+        self.assertNotIn("close_container", settings_source)
+        self.assertNotIn("close_btn", settings_source)
+        self.assertNotIn('Segoe MDL2 Assets', settings_source)
+        self.assertNotIn('E81123', settings_source)
+        self.assertNotIn('E8BB', settings_source)
+        self.assertNotIn('"<Enter>"', settings_source)
+        self.assertNotIn('"<Leave>"', settings_source)
+
     def test_fake_named_host_sentinel_proves_refresh_scope_only(self) -> None:
         """A fake host proves ownership semantics and is not evidence of a Tk tree."""
 
@@ -1000,6 +1137,63 @@ class GuiContractTests(unittest.TestCase):
         self.assertEqual(surface.hosts["actions"].items, ["action:new"])
         self.assertEqual(surface.statusbar, status_before)
         self.assertEqual(surface.hosts["station"].items, station_before)
+
+    # ----------------------------------------------------------------
+    # Startup appearance contract (fix: root flash / white block)
+    # ----------------------------------------------------------------
+
+    def test_startup_appearance_config_exists_before_desktoptoolapp_class(self) -> None:
+        """_configure_startup_appearance must be a module-level callable.
+
+        Its call site (module body) must appear before the ``class DesktopToolApp``
+        line so that CustomTkinter's appearance mode is locked before the first
+        Tk root widget is ever constructed.
+        """
+
+        self.assertIn("def _configure_startup_appearance", APP_SOURCE)
+
+        # Find the first occurrence of the class definition after the call.
+        class_lineno: int | None = None
+        for node in APP_TREE.body:
+            if isinstance(node, ast.ClassDef) and node.name == "DesktopToolApp":
+                class_lineno = node.lineno
+                break
+        self.assertIsNotNone(class_lineno, "DesktopToolApp class not found in AST")
+
+        config_call_lineno: int | None = None
+        for node in APP_TREE.body:
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_configure_startup_appearance"
+            ):
+                config_call_lineno = node.lineno
+                break
+        self.assertIsNotNone(config_call_lineno, "_configure_startup_appearance() call not found at module level")
+        self.assertLess(config_call_lineno, class_lineno,
+                        "_configure_startup_appearance() must be called before DesktopToolApp is defined")
+
+    def test_init_does_not_call_set_appearance_mode_after_super(self) -> None:
+        """DesktopToolApp.__init__ must not place a first-time ctk.set_appearance_mode
+        call after ``super().__init__()`` — the mode is already locked at module level.
+        """
+
+        init_source = _source(_function("__init__"))
+        self.assertIn("super().__init__()", init_source)
+        self.assertNotIn("ctk.set_appearance_mode(self.effective_theme)", init_source)
+
+    def test_toggle_and_refresh_theme_still_invoke_theme_switch(self) -> None:
+        """_toggle_theme and _refresh_theme must still call ctk.set_appearance_mode
+        for runtime theme switching even though startup appearance is set externally.
+        """
+
+        toggle = _source(_function("_toggle_theme"))
+        self.assertIn("self._refresh_theme()", toggle)
+
+        refresh = _source(_function("_refresh_theme"))
+        self.assertIn("ctk.set_appearance_mode(self.effective_theme)", refresh)
+        self.assertIn("self._tokens = theme_tokens(self.effective_theme)", refresh)
 
 
 class _FakeHost:

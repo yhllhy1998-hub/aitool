@@ -7,6 +7,9 @@ __pycache__/
 
 # Desktop tool local state
 data/*.json
+!data/quick_actions.json
+!data/custom_modules.json
+!data/document_station_entries.json
 data/.user_guide_seen
 
 # Platform-specific local config

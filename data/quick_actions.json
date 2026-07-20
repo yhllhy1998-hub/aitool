@@ -1,0 +1,63 @@
+{
+  "actions": [
+    {
+      "id": "quick-copy",
+      "type": "copy",
+      "module_type": "folder-copy",
+      "title": "挂载文件夹覆盖",
+      "desc": "全量覆盖目标目录",
+      "param_fields": [
+        {
+          "key": "source",
+          "label": "来源目录",
+          "browse": "folder"
+        },
+        {
+          "key": "target",
+          "label": "目标目录",
+          "browse": "folder"
+        }
+      ],
+      "params": {
+        "source": "F:/F_tunk/resource/script/autocode",
+        "target": "F:/cehua/test",
+        "source2": "F:/F_tunk/ExcelRoot/Out/LuaFile",
+        "target2": "D:/JP_project/Project_P1/LuaCode/DB/Data"
+      }
+    },
+    {
+      "id": "quick-bat",
+      "type": "bat",
+      "module_type": "launch-bat",
+      "title": "导表工具",
+      "desc": "运行 .bat / .cmd 脚本",
+      "param_fields": [
+        {
+          "key": "script",
+          "label": "脚本路径",
+          "browse": "file"
+        }
+      ],
+      "params": {
+        "script": "F:\\F_tunk\\工具_指定配置文件导出.bat"
+      }
+    },
+    {
+      "id": "quick-svn",
+      "type": "svn",
+      "module_type": "update-svn",
+      "title": "SVN 更新",
+      "desc": "svn update 工作副本",
+      "param_fields": [
+        {
+          "key": "workspace",
+          "label": "svn 工作目录",
+          "browse": "folder"
+        }
+      ],
+      "params": {
+        "workspace": "F:\\F_tunk"
+      }
+    }
+  ]
+}

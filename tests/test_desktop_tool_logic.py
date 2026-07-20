@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -13,6 +14,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from aitool_desktop.models import CustomModule, StationEntry
+import aitool_desktop.app as app_module
 from aitool_desktop.operations import (
     build_folder_copy_dry_run,
     collect_station_entries,
@@ -28,6 +30,79 @@ from aitool_desktop.storage import ModuleStorage
 
 
 class DesktopToolLogicTests(unittest.TestCase):
+    def test_missing_user_quick_actions_loads_builtin_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            builtin_data = root / "repo" / "data"
+            builtin_data.mkdir(parents=True)
+            builtin_actions = {"actions": [{"id": "builtin-action"}]}
+            (builtin_data / "quick_actions.json").write_text(
+                __import__("json").dumps(builtin_actions),
+                encoding="utf-8",
+            )
+
+            with patch.object(app_module, "REPO_ROOT", root / "repo"), patch.object(
+                app_module, "QUICK_ACTIONS_PATH", root / "user" / "quick_actions.json"
+            ):
+                actions = app_module.DesktopToolApp._load_quick_actions(object())
+
+            self.assertEqual(actions, builtin_actions["actions"])
+
+    def test_empty_user_quick_actions_do_not_restore_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            builtin_data = root / "repo" / "data"
+            builtin_data.mkdir(parents=True)
+            (builtin_data / "quick_actions.json").write_text(
+                '{"actions": [{"id": "builtin-action"}]}',
+                encoding="utf-8",
+            )
+            user_actions = root / "user" / "quick_actions.json"
+            user_actions.parent.mkdir()
+            user_actions.write_text('{"actions": []}', encoding="utf-8")
+
+            with patch.object(app_module, "REPO_ROOT", root / "repo"), patch.object(
+                app_module, "QUICK_ACTIONS_PATH", user_actions
+            ):
+                actions = app_module.DesktopToolApp._load_quick_actions(object())
+
+            self.assertEqual(actions, [])
+
+    def test_default_config_initialization_is_whitelisted_and_non_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            builtin_data = root / "repo" / "data"
+            user_data = root / "user" / "AiTool"
+            builtin_data.mkdir(parents=True)
+            user_data.mkdir(parents=True)
+            for filename in (
+                "quick_actions.json",
+                "custom_modules.json",
+                "document_station_entries.json",
+            ):
+                (builtin_data / filename).write_text(f'{{"name": "builtin-{filename}"}}', encoding="utf-8")
+            (builtin_data / "window_geometry.json").write_text("{}", encoding="utf-8")
+            (builtin_data / "aitool.log").write_text("runtime log", encoding="utf-8")
+            (builtin_data / ".user_guide_seen").write_text("seen", encoding="utf-8")
+
+            existing_custom_modules = '{"modules": []}'
+            (user_data / "custom_modules.json").write_text(existing_custom_modules, encoding="utf-8")
+
+            with patch.object(app_module, "REPO_ROOT", root / "repo"), patch.object(
+                app_module, "DATA_DIR", user_data
+            ):
+                app_module.DesktopToolApp._ensure_default_config(object())
+
+            self.assertTrue((user_data / "quick_actions.json").exists())
+            self.assertTrue((user_data / "document_station_entries.json").exists())
+            self.assertEqual(
+                (user_data / "custom_modules.json").read_text(encoding="utf-8"),
+                existing_custom_modules,
+            )
+            self.assertFalse((user_data / "window_geometry.json").exists())
+            self.assertFalse((user_data / "aitool.log").exists())
+            self.assertFalse((user_data / ".user_guide_seen").exists())
+
     def test_collect_station_entries_dedupes_and_filters_missing_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -254,6 +329,13 @@ class DesktopToolLogicTests(unittest.TestCase):
             self.assertEqual(loaded[0].module_type, "folder-copy")
             self.assertEqual(loaded[0].params["source"], "C:\\src")
             self.assertEqual(loaded[0].params["target"], "C:\\dst")
+
+    def test_module_storage_keeps_existing_empty_user_file_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store_path = Path(tmp_dir) / "modules.json"
+            store_path.write_text('{"modules": []}', encoding="utf-8")
+
+            self.assertEqual(ModuleStorage(store_path).load(), [])
 
     def test_module_storage_filters_invalid_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
